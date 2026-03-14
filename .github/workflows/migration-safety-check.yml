@@ -1,0 +1,99 @@
+name: Migration Safety Check (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      migrations-path:
+        description: 'Path to migration files'
+        required: false
+        type: string
+        default: 'db/migrations'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check migration safety
+        run: |
+          MIGRATIONS_PATH="${{ inputs.migrations-path }}"
+          WARNINGS=0
+
+          if [ ! -d "$MIGRATIONS_PATH" ]; then
+            echo "No migrations directory found at ${MIGRATIONS_PATH} -- skipping."
+            exit 0
+          fi
+
+          # Only check migrations added/modified in this PR
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- "$MIGRATIONS_PATH" || true)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "No migration changes detected."
+            exit 0
+          fi
+
+          echo "## Migration Safety Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          for FILE in $CHANGED_FILES; do
+            # Skip non-SQL files
+            [[ "$FILE" != *.sql ]] && continue
+
+            FILENAME=$(basename "$FILE")
+            # Strip SQL comments before checking for dangerous patterns
+            # Removes single-line comments (-- ...) and preserves actual SQL statements
+            CONTENT=$(sed 's/--.*$//' "$FILE" | tr '\n' ' ')
+            FILE_WARNINGS=""
+
+            # Check for dangerous patterns (comment-stripped content only)
+            if echo "$CONTENT" | grep -iqP 'DROP\s+COLUMN'; then
+              FILE_WARNINGS="${FILE_WARNINGS}\n  - DROP COLUMN detected. Has the previous app version stopped using this column?"
+            fi
+
+            if echo "$CONTENT" | grep -iqP 'DROP\s+TABLE'; then
+              FILE_WARNINGS="${FILE_WARNINGS}\n  - DROP TABLE detected. Has the previous app version stopped using this table?"
+            fi
+
+            if echo "$CONTENT" | grep -iqP 'sp_rename'; then
+              FILE_WARNINGS="${FILE_WARNINGS}\n  - sp_rename detected. Renaming breaks the previous app version. Consider adding a new column instead."
+            fi
+
+            if echo "$CONTENT" | grep -iqP 'ALTER\s+COLUMN\s+\S+\s+(INT|BIGINT|VARCHAR|NVARCHAR|DECIMAL|FLOAT|BIT|DATETIME|DATE)\b'; then
+              FILE_WARNINGS="${FILE_WARNINGS}\n  - ALTER COLUMN type change detected. Old app inserts/reads may break with the new type."
+            fi
+
+            # Check for NOT NULL without DEFAULT on the same statement
+            if echo "$CONTENT" | grep -iqP '(ADD|ALTER)\s+.*NOT\s+NULL(?!.*DEFAULT)'; then
+              FILE_WARNINGS="${FILE_WARNINGS}\n  - NOT NULL without DEFAULT detected. Old app inserts will fail. Add a DEFAULT or make the column nullable."
+            fi
+
+            if [ -n "$FILE_WARNINGS" ]; then
+              WARNINGS=$((WARNINGS + 1))
+
+              # Check if migration has a safety comment (check original file, not comment-stripped)
+              if grep -iq 'MIGRATION SAFETY:' "$FILE"; then
+                echo "::notice file=${FILE}::Migration has dangerous operations but includes a MIGRATION SAFETY comment. Reviewer: verify the explanation."
+                echo "- **${FILENAME}** -- Flagged operations with safety comment" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::warning file=${FILE}::Migration contains potentially rollback-unsafe operations:${FILE_WARNINGS}%0AAdd a '-- MIGRATION SAFETY:' comment explaining why this is safe."
+                echo "- **${FILENAME}** -- Flagged operations, **no safety comment**" >> "$GITHUB_STEP_SUMMARY"
+              fi
+
+              echo -e "  ${FILE_WARNINGS}" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- **${FILENAME}** -- Safe" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$WARNINGS" -gt 0 ]; then
+            echo "**$WARNINGS migration(s) flagged.** Review the safety comments before approving." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**All migrations are backward-compatible.**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Warnings only -- never blocks the build
+          exit 0

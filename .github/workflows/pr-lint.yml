@@ -1,0 +1,46 @@
+name: PR Lint (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      require-scope:
+        description: 'Require a scope in the conventional commit (e.g., feat(booking): ...)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            const requireScope = ${{ inputs.require-scope }};
+
+            // Conventional commit pattern
+            const pattern = requireScope
+              ? /^(feat|fix|perf|refactor|docs|chore|test|style|ci|build|revert)(\([a-z][a-z0-9-]*\))!?:\s.+/
+              : /^(feat|fix|perf|refactor|docs|chore|test|style|ci|build|revert)(\([a-z][a-z0-9-]*\))?!?:\s.+/;
+
+            if (!pattern.test(title)) {
+              const scopeHint = requireScope
+                ? ' A scope is required, e.g., feat(booking): ...'
+                : ' A scope is optional but recommended, e.g., feat(booking): ...';
+
+              core.setFailed(
+                `PR title does not follow Conventional Commits format.\n\n` +
+                `Title: "${title}"\n\n` +
+                `Expected format: type(scope): description\n` +
+                `Valid types: feat, fix, perf, refactor, docs, chore, test, style, ci, build, revert\n` +
+                `${scopeHint}\n\n` +
+                `Examples:\n` +
+                `  feat(booking): add walk-in appointment scheduling\n` +
+                `  fix(warehouse): correct pick request timeout handling\n` +
+                `  chore: update CI dependencies`
+              );
+            } else {
+              core.info(`PR title is valid: "${title}"`);
+            }

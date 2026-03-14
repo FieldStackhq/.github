@@ -1,0 +1,154 @@
+name: Release Tag (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: 'Name of the build artifact to attach to the release'
+        required: false
+        type: string
+        default: ''
+      artifact-path:
+        description: 'Path to the build artifact'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      version:
+        description: 'The CalVer version that was created (e.g., 2026.3.5)'
+        value: ${{ jobs.tag.outputs.version }}
+      tag:
+        description: 'The Git tag that was created (e.g., v2026.3.5)'
+        value: ${{ jobs.tag.outputs.tag }}
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calver.outputs.version }}
+      tag: ${{ steps.calver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for tag calculation and changelog
+
+      - name: Calculate next CalVer version
+        id: calver
+        run: |
+          YEAR=$(date +%Y)
+          MONTH=$(date +%-m)  # No zero-padding
+          PREFIX="v${YEAR}.${MONTH}."
+
+          # Find the highest patch number for this month (numeric sort, not lexicographic)
+          LATEST_PATCH=$(git tag --list "${PREFIX}*" | sed "s|^${PREFIX}||" | sort -n -r | head -n 1)
+
+          if [ -z "$LATEST_PATCH" ]; then
+            PATCH=1
+          else
+            PATCH=$((LATEST_PATCH + 1))
+          fi
+
+          VERSION="${YEAR}.${MONTH}.${PATCH}"
+          TAG="v${VERSION}"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Calculated version: ${VERSION} (tag: ${TAG})"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          TAG="${{ steps.calver.outputs.tag }}"
+
+          # Find the previous CalVer tag (excluding any tag we're about to create)
+          PREV_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-creatordate | head -n 1)
+
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          # Parse conventional commits into changelog sections
+          FEATURES=""
+          FIXES=""
+          PERF=""
+          BREAKING=""
+
+          while IFS= read -r line; do
+            # Skip empty lines
+            [ -z "$line" ] && continue
+
+            # Extract PR number if present
+            PR_NUM=$(echo "$line" | grep -oP '\(#\d+\)' | tr -d '()')
+
+            # Breaking changes go ONLY to BREAKING (not duplicated in Features/Fixes)
+            if echo "$line" | grep -qP '^feat(\(.+\))?!:'; then
+              ENTRY=$(echo "$line" | sed -E 's/^feat\(([^)]+)\)!: /- **\1**: /' | sed 's/^feat!: /- /')
+              BREAKING="${BREAKING}${ENTRY}\n"
+            elif echo "$line" | grep -qP '^fix(\(.+\))?!:'; then
+              ENTRY=$(echo "$line" | sed -E 's/^fix\(([^)]+)\)!: /- **\1**: /' | sed 's/^fix!: /- /')
+              BREAKING="${BREAKING}${ENTRY}\n"
+            elif echo "$line" | grep -qP '^feat(\(.+\))?:'; then
+              ENTRY=$(echo "$line" | sed -E 's/^feat\(([^)]+)\): /- **\1**: /' | sed 's/^feat: /- /')
+              FEATURES="${FEATURES}${ENTRY}\n"
+            elif echo "$line" | grep -qP '^fix(\(.+\))?:'; then
+              ENTRY=$(echo "$line" | sed -E 's/^fix\(([^)]+)\): /- **\1**: /' | sed 's/^fix: /- /')
+              FIXES="${FIXES}${ENTRY}\n"
+            elif echo "$line" | grep -qP '^perf(\(.+\))?:'; then
+              ENTRY=$(echo "$line" | sed -E 's/^perf\(([^)]+)\): /- **\1**: /' | sed 's/^perf: /- /')
+              PERF="${PERF}${ENTRY}\n"
+            fi
+          done <<< "$(git log --oneline --format='%s' $RANGE)"
+
+          # Build changelog body
+          BODY="## What's Changed\n\n"
+
+          if [ -n "$BREAKING" ]; then
+            BODY="${BODY}### Breaking Changes\n${BREAKING}\n"
+          fi
+          if [ -n "$FEATURES" ]; then
+            BODY="${BODY}### Features\n${FEATURES}\n"
+          fi
+          if [ -n "$FIXES" ]; then
+            BODY="${BODY}### Bug Fixes\n${FIXES}\n"
+          fi
+          if [ -n "$PERF" ]; then
+            BODY="${BODY}### Performance\n${PERF}\n"
+          fi
+
+          if [ -n "$PREV_TAG" ]; then
+            BODY="${BODY}**Full Changelog**: ${PREV_TAG}...${TAG}\n"
+          fi
+
+          # Write to file for the release step
+          echo -e "$BODY" > changelog.md
+          echo "Generated changelog for ${TAG}"
+
+      - name: Create Git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.calver.outputs.tag }}" -m "Release ${{ steps.calver.outputs.version }}"
+          git push origin "${{ steps.calver.outputs.tag }}"
+
+      - name: Download build artifact
+        if: inputs.artifact-name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./release-artifact
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.calver.outputs.tag }}
+          name: ${{ steps.calver.outputs.version }}
+          body_path: changelog.md
+          files: |
+            ./release-artifact/**
+          draft: false
+          prerelease: false
