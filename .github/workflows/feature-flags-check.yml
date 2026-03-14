@@ -1,0 +1,115 @@
+name: Feature Flags Check (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      registry-path:
+        description: 'Path to feature-flags.json'
+        required: false
+        type: string
+        default: 'feature-flags.json'
+      source-paths:
+        description: 'Comma-separated paths to scan for flag references'
+        required: false
+        type: string
+        default: 'src/'
+      warn-days-before-expiry:
+        description: 'Days before expiration to start warning'
+        required: false
+        type: number
+        default: 7
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate feature flag registry
+        run: |
+          REGISTRY="${{ inputs.registry-path }}"
+          SOURCE_PATHS="${{ inputs.source-paths }}"
+          WARN_DAYS=${{ inputs.warn-days-before-expiry }}
+          TODAY=$(date +%Y-%m-%d)
+          ERRORS=0
+          WARNINGS=0
+
+          if [ ! -f "$REGISTRY" ]; then
+            echo "No feature flag registry found at ${REGISTRY} -- skipping."
+            exit 0
+          fi
+
+          echo "## Feature Flag Validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Parse flags from JSON
+          FLAGS=$(jq -r '.flags | keys[]' "$REGISTRY")
+
+          for FLAG in $FLAGS; do
+            TYPE=$(jq -r ".flags[\"$FLAG\"].type" "$REGISTRY")
+            OWNER=$(jq -r ".flags[\"$FLAG\"].owner" "$REGISTRY")
+            EXPIRES=$(jq -r ".flags[\"$FLAG\"].expires // empty" "$REGISTRY")
+            REASON=$(jq -r ".flags[\"$FLAG\"].reason // empty" "$REGISTRY")
+
+            # Type validation
+            if [ "$TYPE" = "temporary" ] || [ "$TYPE" = "experiment" ]; then
+              if [ -z "$EXPIRES" ]; then
+                echo "::error::Flag '$FLAG' (type: $TYPE) must have an 'expires' date."
+                ERRORS=$((ERRORS + 1))
+              fi
+            fi
+
+            if [ "$TYPE" = "permanent" ]; then
+              if [ -z "$REASON" ]; then
+                echo "::warning::Flag '$FLAG' (type: permanent) should have a 'reason' explaining why it's permanent."
+                WARNINGS=$((WARNINGS + 1))
+              fi
+            fi
+
+            # Expiration check (GNU date on GitHub Actions runners)
+            if [ -n "$EXPIRES" ]; then
+              EXPIRES_EPOCH=$(date -d "$EXPIRES" +%s 2>/dev/null || date -jf "%Y-%m-%d" "$EXPIRES" +%s 2>/dev/null || echo "0")
+              TODAY_EPOCH=$(date -d "$TODAY" +%s 2>/dev/null || date -jf "%Y-%m-%d" "$TODAY" +%s 2>/dev/null)
+              WARN_EPOCH=$((EXPIRES_EPOCH - WARN_DAYS * 86400))
+
+              if [ "$TODAY_EPOCH" -gt "$EXPIRES_EPOCH" ]; then
+                echo "::error::Flag '$FLAG' expired on $EXPIRES. Remove it or extend the expiration with a justification. Owner: $OWNER"
+                ERRORS=$((ERRORS + 1))
+              elif [ "$TODAY_EPOCH" -gt "$WARN_EPOCH" ]; then
+                echo "::warning::Flag '$FLAG' expires on $EXPIRES (within $WARN_DAYS days). Plan cleanup. Owner: $OWNER"
+                WARNINGS=$((WARNINGS + 1))
+              fi
+            fi
+
+            echo "- **$FLAG** (type: $TYPE, owner: $OWNER)" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # Orphan detection: flags in code but not in registry
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Orphan Check" >> "$GITHUB_STEP_SUMMARY"
+
+          IFS=',' read -ra PATHS <<< "$SOURCE_PATHS"
+          for SPATH in "${PATHS[@]}"; do
+            if [ -d "$SPATH" ]; then
+              # Find flag references in source code (.cs and .ts/.tsx files)
+              CODE_FLAGS=$(grep -rhoE '(IsEnabled|useFeatureFlag)\s*\(\s*"[^"]+"' "$SPATH" \
+                --include='*.cs' --include='*.ts' --include='*.tsx' \
+                | grep -oE '"[^"]+"' | tr -d '"' | sort -u || true)
+
+              for CODE_FLAG in $CODE_FLAGS; do
+                if ! echo "$FLAGS" | grep -qx "$CODE_FLAG"; then
+                  echo "::warning::Flag '$CODE_FLAG' referenced in code but not found in registry."
+                  WARNINGS=$((WARNINGS + 1))
+                fi
+              done
+            fi
+          done
+
+          # Summary
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Result:** $ERRORS errors, $WARNINGS warnings" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "Feature flag validation failed with $ERRORS error(s)."
+            exit 1
+          fi
