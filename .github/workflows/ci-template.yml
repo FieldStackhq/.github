@@ -1,0 +1,53 @@
+name: CI (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: 'Build command (e.g., dotnet build, npm run build)'
+        required: true
+        type: string
+      test-command:
+        description: 'Test command (e.g., dotnet test, npm test)'
+        required: true
+        type: string
+      working-directory:
+        description: 'Working directory for build/test'
+        required: false
+        type: string
+        default: '.'
+      node-version:
+        required: false
+        type: string
+        default: ''
+      dotnet-version:
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        if: inputs.dotnet-version != ''
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Setup Node.js
+        if: inputs.node-version != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Test
+        run: ${{ inputs.test-command }}

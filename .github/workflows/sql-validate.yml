@@ -1,0 +1,126 @@
+name: SQL Validation (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      schema:
+        description: 'The SQL schema this repo owns'
+        required: true
+        type: string
+      migration-prefix:
+        description: 'Expected prefix for migration filenames'
+        required: true
+        type: string
+      allowed-read-schemas:
+        description: 'Comma-separated list of schemas this repo can SELECT from'
+        required: false
+        type: string
+        default: 'dbo'
+    secrets:
+      ORCHESTRATOR_PAT:
+        description: 'PAT to send repository_dispatch to orchestrator'
+        required: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install sqlfluff
+        run: pip install sqlfluff==3.*
+
+      - name: Lint SQL files
+        run: |
+          if find db/ -name '*.sql' -type f | head -1 | grep -q .; then
+            sqlfluff lint db/ \
+              --dialect tsql \
+              --config db/.sqlfluff \
+              --format github-annotation-native \
+              || true
+          else
+            echo "No SQL files found -- skipping lint"
+          fi
+
+      - name: Validate migration naming
+        run: |
+          ERRORS=0
+          for f in $(git diff --name-only --diff-filter=A origin/main -- 'db/migrations/*.sql'); do
+            BASENAME=$(basename "$f")
+            if ! echo "$BASENAME" | grep -qP '^\d{8}_\d{3}__\w+\.sql$'; then
+              echo "::error file=$f::Invalid migration name. Expected: YYYYMMDD_NNN__description.sql"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          exit $ERRORS
+
+      - name: Check migration immutability
+        run: |
+          MODIFIED=$(git diff --name-only --diff-filter=M origin/main -- 'db/migrations/*.sql')
+          if [ -n "$MODIFIED" ]; then
+            echo "::error::Migrations are immutable once merged. These files were modified:"
+            echo "$MODIFIED"
+            exit 1
+          fi
+
+      - name: Validate schema ownership
+        run: |
+          SCHEMA="${{ inputs.schema }}"
+          ERRORS=0
+          for f in $(find db/ -name '*.sql' -type f); do
+            VIOLATIONS=$(grep -inP '(CREATE|ALTER|DROP)\s+(TABLE|PROCEDURE|FUNCTION|VIEW|INDEX|TRIGGER|SCHEMA)\s+\[?(?!'"$SCHEMA"'\b)(?!dbo\b)(\w+)\]?\.' "$f" 2>/dev/null || true)
+            if [ -n "$VIOLATIONS" ]; then
+              echo "::error file=$f::Schema ownership violation -- this repo can only CREATE/ALTER/DROP in [$SCHEMA]:"
+              echo "$VIOLATIONS"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          exit $ERRORS
+
+      - name: Validate programmable objects use CREATE OR ALTER
+        run: |
+          ERRORS=0
+          for f in $(find db/programmable/ -name '*.sql' -type f 2>/dev/null); do
+            if ! grep -qiP 'CREATE\s+OR\s+ALTER' "$f"; then
+              echo "::error file=$f::Programmable objects must use CREATE OR ALTER"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          exit $ERRORS
+
+      - name: Check for dangerous operations
+        run: |
+          ERRORS=0
+          for f in $(git diff --name-only origin/main -- 'db/**/*.sql'); do
+            [ -f "$f" ] || continue
+            if grep -qiP 'DROP\s+TABLE' "$f" && ! grep -q '-- APPROVED-DROP' "$f"; then
+              echo "::error file=$f::Contains DROP TABLE without '-- APPROVED-DROP: reason' comment"
+              ERRORS=$((ERRORS + 1))
+            fi
+            if grep -qiP '\bTRUNCATE\b' "$f"; then
+              echo "::error file=$f::TRUNCATE is not allowed in migrations"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          exit $ERRORS
+
+  notify:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Signal orchestrator
+        if: secrets.ORCHESTRATOR_PAT != ''
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.ORCHESTRATOR_PAT }}
+          repository: FieldStackHQ/fieldstack-db-deploy
+          event-type: domain-sql-updated
+          client-payload: '{"repo": "${{ github.repository }}", "schema": "${{ inputs.schema }}", "sha": "${{ github.sha }}", "triggered_by": "${{ github.actor }}"}'
