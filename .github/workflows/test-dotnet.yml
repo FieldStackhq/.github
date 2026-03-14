@@ -1,0 +1,105 @@
+name: .NET Tests (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        description: '.NET SDK version'
+        required: false
+        type: string
+        default: '8.0.x'
+      test-filter:
+        description: 'dotnet test --filter expression (e.g., Category=Unit)'
+        required: false
+        type: string
+        default: ''
+      run-integration-tests:
+        description: 'Run integration tests (requires Docker for Testcontainers)'
+        required: false
+        type: boolean
+        default: true
+      coverage-threshold:
+        description: 'Minimum line coverage percentage (0 to disable)'
+        required: false
+        type: number
+        default: 0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # Unit tests - always run, fast
+      - name: Run unit tests
+        run: |
+          dotnet test --no-build --configuration Release \
+            --filter "FullyQualifiedName~UnitTests" \
+            --logger "trx;LogFileName=unit-results.trx" \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./test-results/unit
+
+      # Integration tests - optional, requires Docker
+      - name: Run integration tests
+        if: inputs.run-integration-tests
+        run: |
+          FILTER="FullyQualifiedName~IntegrationTests"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            FILTER="${FILTER}&${{ inputs.test-filter }}"
+          fi
+          dotnet test --no-build --configuration Release \
+            --filter "$FILTER" \
+            --logger "trx;LogFileName=integration-results.trx" \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./test-results/integration
+
+      # Coverage report
+      - name: Generate coverage report
+        if: always()
+        run: |
+          dotnet tool install --global dotnet-reportgenerator-globaltool
+          reportgenerator \
+            -reports:"./test-results/**/coverage.cobertura.xml" \
+            -targetdir:"./coverage-report" \
+            -reporttypes:"MarkdownSummaryGithub;Cobertura"
+
+      - name: Add coverage to summary
+        if: always()
+        run: |
+          if [ -f "./coverage-report/SummaryGithub.md" ]; then
+            cat ./coverage-report/SummaryGithub.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check coverage threshold
+        if: inputs.coverage-threshold > 0
+        run: |
+          COVERAGE=$(grep -oP 'line-rate="\K[^"]+' ./coverage-report/Cobertura.xml | head -1)
+          PERCENT=$(echo "$COVERAGE * 100" | bc)
+          THRESHOLD=${{ inputs.coverage-threshold }}
+          if (( $(echo "$PERCENT < $THRESHOLD" | bc -l) )); then
+            echo "::error::Coverage ${PERCENT}% is below threshold ${THRESHOLD}%"
+            exit 1
+          fi
+          echo "Coverage: ${PERCENT}% (threshold: ${THRESHOLD}%)"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            ./test-results/**/*.trx
+            ./coverage-report/
