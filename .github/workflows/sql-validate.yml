@@ -100,7 +100,7 @@ jobs:
           ERRORS=0
           for f in $(git diff --name-only origin/main -- 'db/**/*.sql'); do
             [ -f "$f" ] || continue
-            if grep -qiP 'DROP\s+TABLE' "$f" && ! grep -q '-- APPROVED-DROP' "$f"; then
+            if grep -qiP 'DROP\s+TABLE' "$f" && ! grep -qF -- '-- APPROVED-DROP' "$f"; then
               echo "::error file=$f::Contains DROP TABLE without '-- APPROVED-DROP: reason' comment"
               ERRORS=$((ERRORS + 1))
             fi
