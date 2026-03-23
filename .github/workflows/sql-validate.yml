@@ -11,6 +11,11 @@ on:
         description: 'Expected prefix for migration filenames'
         required: true
         type: string
+      skip-immutability-check:
+        description: 'One-time bypass for migration renames (set to true, remove after merge)'
+        required: false
+        type: boolean
+        default: false
       allowed-read-schemas:
         description: 'Comma-separated list of schemas this repo can SELECT from'
         required: false
@@ -54,14 +59,29 @@ jobs:
           ERRORS=0
           for f in $(git diff --name-only --diff-filter=A origin/main -- 'db/migrations/*.sql'); do
             BASENAME=$(basename "$f")
-            if ! echo "$BASENAME" | grep -qP '^\d{8}_\d{3}__\w+\.sql$'; then
-              echo "::error file=$f::Invalid migration name. Expected: YYYYMMDD_NNN__description.sql"
+            if ! echo "$BASENAME" | grep -qP '^\d{8}_([a-z]{2,4}_)?\d{3}__\w+\.sql$'; then
+              echo "::error file=$f::Invalid migration name. Expected: YYYYMMDD_NNN__description.sql or YYYYMMDD_PREFIX_NNN__description.sql"
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          exit $ERRORS
+
+      - name: Enforce prefix on new migrations
+        if: ${{ inputs.migration-prefix != '' }}
+        run: |
+          ERRORS=0
+          PREFIX="${{ inputs.migration-prefix }}"
+          for f in $(git diff --name-only --diff-filter=A origin/main -- 'db/migrations/*.sql'); do
+            BASENAME=$(basename "$f")
+            if ! echo "$BASENAME" | grep -qP "^\d{8}_${PREFIX}_\d{3}__\w+\.sql$"; then
+              echo "::error file=$f::New migration must use prefix '${PREFIX}'. Expected: YYYYMMDD_${PREFIX}_NNN__description.sql"
               ERRORS=$((ERRORS + 1))
             fi
           done
           exit $ERRORS
 
       - name: Check migration immutability
+        if: ${{ !inputs.skip-immutability-check }}
         run: |
           MODIFIED=$(git diff --name-only --diff-filter=M origin/main -- 'db/migrations/*.sql')
           if [ -n "$MODIFIED" ]; then
