@@ -102,10 +102,13 @@ jobs:
           done
           exit $ERRORS
 
-      - name: Check for dangerous operations
+      - name: Check for dangerous operations in migrations
+        # Only scan db/migrations/. Programmable objects (sprocs, views,
+        # functions) legitimately use DROP TABLE #temp and TRUNCATE TABLE #temp
+        # for temp tables. Those are never migration-safety concerns.
         run: |
           ERRORS=0
-          for f in $(git diff --name-only origin/main -- 'db/**/*.sql'); do
+          for f in $(git diff --name-only origin/main -- 'db/migrations/*.sql'); do
             [ -f "$f" ] || continue
             if grep -qiP 'DROP\s+TABLE' "$f" && ! grep -qF -- '-- APPROVED-DROP' "$f"; then
               echo "::error file=$f::Contains DROP TABLE without '-- APPROVED-DROP: reason' comment"
