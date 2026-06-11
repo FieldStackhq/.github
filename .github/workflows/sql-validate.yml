@@ -143,7 +143,9 @@ jobs:
           fi
 
       - name: Signal orchestrator
-        if: steps.pat.outputs.available == 'true'
+        # Explicit success(): a custom if drops the implicit guard, and this
+        # step must not fire after a failure in any step added before it.
+        if: success() && steps.pat.outputs.available == 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
         with:
           token: ${{ secrets.ORCHESTRATOR_PAT }}
