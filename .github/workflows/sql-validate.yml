@@ -126,8 +126,26 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
+      # A silently-skipped dispatch means a merged db/ change never deploys.
+      # Missing PAT -> visible warning annotation (green run); dispatch API
+      # failure -> red run. The orchestrator's detect-missed-dispatch watchdog
+      # remains the retroactive backstop either way.
+      - name: Check ORCHESTRATOR_PAT availability
+        id: pat
+        env:
+          PAT: ${{ secrets.ORCHESTRATOR_PAT }}
+        run: |
+          if [ -z "$PAT" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ORCHESTRATOR_PAT is not set -- skipping the db-deploy dispatch. This merged db/ change will NOT deploy until a deploy is triggered another way."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Signal orchestrator
-        continue-on-error: true
+        # Explicit success(): a custom if drops the implicit guard, and this
+        # step must not fire after a failure in any step added before it.
+        if: success() && steps.pat.outputs.available == 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
         with:
           token: ${{ secrets.ORCHESTRATOR_PAT }}
