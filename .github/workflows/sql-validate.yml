@@ -29,20 +29,65 @@ on:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    # db_changed drives both this job's checks and the notify dispatch. The job
+    # itself always runs (so a caller that drops its push `paths:` filter still
+    # gets a green check on every main push); the work inside is gated on a real
+    # git diff instead.
+    outputs:
+      db_changed: ${{ steps.detect.outputs.db_changed }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
+      - name: Detect db/ changes
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        # git diff is authoritative about what changed. GitHub's push/PR
+        # `paths:` filter only inspects the first ~300 files of a diff, so a
+        # repo-wide commit (e.g. a format-everything PR) can hide its db/ files
+        # past that window and silently skip the whole dispatch. Computing the
+        # change set here removes that dependency: a caller can trigger on every
+        # main push and rely on this gate.
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="origin/${BASE_REF:-main}...HEAD"
+          elif [ -n "${BEFORE:-}" ] \
+               && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            RANGE="${BEFORE} ${GITHUB_SHA}"
+          else
+            # New branch / unknown base -- no computable range. Assume changed so
+            # a real db/ edit is never dropped (an extra no-op deploy is
+            # harmless; a missed one is the bug this gate exists to prevent).
+            RANGE=""
+          fi
+          if [ -z "$RANGE" ]; then
+            CHANGED=true
+          elif git diff --name-only $RANGE -- 'db/**' | grep -q .; then
+            CHANGED=true
+          else
+            CHANGED=false
+          fi
+          echo "event=$EVENT range='${RANGE:-<assume-changed>}' db_changed=$CHANGED"
+          echo "db_changed=$CHANGED" >> "$GITHUB_OUTPUT"
+
       - name: Set up Python
+        if: steps.detect.outputs.db_changed == 'true'
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: '3.12'
 
       - name: Install sqlfluff
+        if: steps.detect.outputs.db_changed == 'true'
         run: pip install sqlfluff==3.*
 
       - name: Lint SQL files
+        if: steps.detect.outputs.db_changed == 'true'
         run: |
           if find db/ -name '*.sql' -type f | head -1 | grep -q .; then
             sqlfluff lint db/ \
@@ -55,6 +100,7 @@ jobs:
           fi
 
       - name: Validate migration filenames (YYYYMMDD_PREFIX_NNN__description.sql)
+        if: steps.detect.outputs.db_changed == 'true'
         run: |
           ERRORS=0
           PREFIX="${{ inputs.migration-prefix }}"
@@ -68,7 +114,7 @@ jobs:
           exit $ERRORS
 
       - name: Check migration immutability
-        if: ${{ !inputs.skip-immutability-check }}
+        if: ${{ steps.detect.outputs.db_changed == 'true' && !inputs.skip-immutability-check }}
         run: |
           MODIFIED=$(git diff --name-only --diff-filter=M origin/main -- 'db/migrations/*.sql')
           if [ -n "$MODIFIED" ]; then
@@ -78,6 +124,7 @@ jobs:
           fi
 
       - name: Validate schema ownership
+        if: steps.detect.outputs.db_changed == 'true'
         run: |
           SCHEMA="${{ inputs.schema }}"
           ERRORS=0
@@ -92,6 +139,7 @@ jobs:
           exit $ERRORS
 
       - name: Validate programmable objects use CREATE OR ALTER
+        if: steps.detect.outputs.db_changed == 'true'
         run: |
           ERRORS=0
           for f in $(find db/programmable/ -name '*.sql' -type f 2>/dev/null); do
@@ -103,6 +151,7 @@ jobs:
           exit $ERRORS
 
       - name: Check for dangerous operations in migrations
+        if: steps.detect.outputs.db_changed == 'true'
         # Only scan db/migrations/. Programmable objects (sprocs, views,
         # functions) legitimately use DROP TABLE #temp and TRUNCATE TABLE #temp
         # for temp tables. Those are never migration-safety concerns.
@@ -122,7 +171,10 @@ jobs:
           exit $ERRORS
 
   notify:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Dispatch only when a main push actually changed db/ (per the git-diff
+    # gate, not GitHub's path filter). validate is a dependency so a failing
+    # check still blocks the dispatch.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.db_changed == 'true'
     needs: validate
     runs-on: ubuntu-latest
     steps:
