@@ -70,7 +70,7 @@ jobs:
       - name: Generate coverage report
         if: always()
         run: |
-          dotnet tool install --global dotnet-reportgenerator-globaltool
+          dotnet tool update --global dotnet-reportgenerator-globaltool
           reportgenerator \
             -reports:"./test-results/**/coverage.cobertura.xml" \
             -targetdir:"./coverage-report" \
