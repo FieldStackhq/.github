@@ -28,7 +28,7 @@ on:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     # db_changed drives both this job's checks and the notify dispatch. The job
     # itself always runs (so a caller that drops its push `paths:` filter still
     # gets a green check on every main push); the work inside is gated on a real
@@ -176,7 +176,7 @@ jobs:
     # check still blocks the dispatch.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.db_changed == 'true'
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       # A silently-skipped dispatch means a merged db/ change never deploys.
       # Missing PAT -> visible warning annotation (green run); dispatch API
