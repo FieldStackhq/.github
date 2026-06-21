@@ -13,6 +13,10 @@ jobs:
   lint:
     runs-on: [self-hosted, linux, x64]
     steps:
+      - name: Clean workspace (self-hosted pre-run maintenance)
+        working-directory: ${{ github.workspace }}
+        run: sudo find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        shell: bash
       - name: Check PR title
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:

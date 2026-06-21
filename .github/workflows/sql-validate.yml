@@ -36,6 +36,10 @@ jobs:
     outputs:
       db_changed: ${{ steps.detect.outputs.db_changed }}
     steps:
+      - name: Clean workspace (self-hosted pre-run maintenance)
+        working-directory: ${{ github.workspace }}
+        run: sudo find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        shell: bash
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
@@ -178,6 +182,10 @@ jobs:
     needs: validate
     runs-on: [self-hosted, linux, x64]
     steps:
+      - name: Clean workspace (self-hosted pre-run maintenance)
+        working-directory: ${{ github.workspace }}
+        run: sudo find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+        shell: bash
       # A silently-skipped dispatch means a merged db/ change never deploys.
       # Missing PAT -> visible warning annotation (green run); dispatch API
       # failure -> red run. The orchestrator's detect-missed-dispatch watchdog
