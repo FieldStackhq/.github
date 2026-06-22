@@ -21,6 +21,16 @@ on:
         required: false
         type: string
         default: 'dbo'
+      dispatch-dev-deploy:
+        description: >-
+          On merge to main, dispatch the dev DB deploy (domain-sql-updated) to
+          fieldstack-db-deploy. Set false when the calling repo deploys its own
+          dev DB by another mechanism (e.g. from its release pipeline) -- this
+          flag only disables the dispatch from this workflow; SQL validation
+          still runs.
+        required: false
+        type: boolean
+        default: true
     secrets:
       ORCHESTRATOR_PAT:
         description: 'PAT to send repository_dispatch to orchestrator'
@@ -177,8 +187,9 @@ jobs:
   notify:
     # Dispatch only when a main push actually changed db/ (per the git-diff
     # gate, not GitHub's path filter). validate is a dependency so a failing
-    # check still blocks the dispatch.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.db_changed == 'true'
+    # check still blocks the dispatch. Skipped entirely when the caller sets
+    # dispatch-dev-deploy: false (it deploys its own dev DB another way).
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.db_changed == 'true' && inputs.dispatch-dev-deploy }}
     needs: validate
     runs-on: [self-hosted, linux, x64]
     steps:
@@ -212,3 +223,17 @@ jobs:
           repository: FieldStackHQ/fieldstack-db-deploy
           event-type: domain-sql-updated
           client-payload: '{"repo": "${{ github.repository }}", "schema": "${{ inputs.schema }}", "sha": "${{ github.sha }}", "triggered_by": "${{ github.actor }}"}'
+
+  # Breadcrumb for the suppressed-dispatch case: when a main push changed db/ but
+  # the caller set dispatch-dev-deploy: false, the `notify` job is skipped and a
+  # skipped job alone cannot say WHY (deliberate flag vs. not-a-main-push vs. no
+  # db/ change all look identical). This sibling job runs only on the deliberate
+  # suppression and leaves a searchable ::notice:: in the log. A step inside
+  # `notify` could not do this -- steps do not run when their job is gated out.
+  notify-suppressed:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.db_changed == 'true' && !inputs.dispatch-dev-deploy }}
+    needs: validate
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Note suppressed dispatch
+        run: echo "::notice::dispatch-dev-deploy is false -- the domain-sql-updated dispatch was skipped for this db/ change. The calling repo is expected to deploy its own dev DB (e.g. from its release pipeline)."
