@@ -21,6 +21,16 @@ on:
         required: false
         type: string
         default: 'dbo'
+      dispatch-dev-deploy:
+        description: >-
+          On merge to main, dispatch the dev DB deploy (domain-sql-updated) to
+          fieldstack-db-deploy. Set false when the calling repo deploys its own
+          dev DB another way (e.g. gated in its release pipeline via a
+          workflow_call to deploy-dev.yml) -- this only disables the dispatch;
+          SQL validation still runs.
+        required: false
+        type: boolean
+        default: true
     secrets:
       ORCHESTRATOR_PAT:
         description: 'PAT to send repository_dispatch to orchestrator'
@@ -177,8 +187,9 @@ jobs:
   notify:
     # Dispatch only when a main push actually changed db/ (per the git-diff
     # gate, not GitHub's path filter). validate is a dependency so a failing
-    # check still blocks the dispatch.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.db_changed == 'true'
+    # check still blocks the dispatch. Skipped entirely when the caller sets
+    # dispatch-dev-deploy: false (it deploys its own dev DB another way).
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.validate.outputs.db_changed == 'true' && inputs.dispatch-dev-deploy }}
     needs: validate
     runs-on: [self-hosted, linux, x64]
     steps:
