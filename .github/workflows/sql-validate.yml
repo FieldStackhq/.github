@@ -127,6 +127,70 @@ jobs:
           done
           exit $ERRORS
 
+      - name: Check migration ID uniqueness (no duplicate IDs vs main or within the PR)
+        if: steps.detect.outputs.db_changed == 'true'
+        # Catches at PR time the duplicate-migration-ID condition that otherwise only surfaces when
+        # the cross-repo db-deploy manifest is built post-merge (SqlCollector.BuildManifest ->
+        # "Duplicate migration ID ... found in" -> the deploy aborts). The migration ID is the
+        # filename up to '__' (matching db-deploy's ExtractMigrationId). Because every repo owns a
+        # unique migration prefix, two repos cannot produce the same ID -- an ID collision is always
+        # WITHIN one repo -- so comparing the PR's new IDs against this repo's own main is sufficient,
+        # and this runs for every repo that calls this reusable workflow.
+        #
+        # Caveat: this compares against main as it is when the check runs. Two concurrently-open PRs
+        # that each add the same ID both pass until one merges; the second is caught only when it is
+        # re-validated against the now-updated main. Pair this with require-branches-up-to-date (or a
+        # merge queue) on db-touching repos to close that race; an --admin merge of a stale branch
+        # bypasses it.
+        run: |
+          set -euo pipefail
+          id_of() { basename "$1" | sed -E 's/__.*//'; }
+
+          # Raw (non-unique) IDs this PR adds; the filename step already guaranteed each has '__',
+          # so id_of always yields a non-empty value.
+          ADDED_RAW=$(
+            for f in $(git diff --name-only --diff-filter=A origin/main -- 'db/migrations/*.sql'); do
+              id_of "$f"
+            done
+          )
+          if [ -z "$ADDED_RAW" ]; then
+            echo "No new migrations -- nothing to check."
+            exit 0
+          fi
+          ADDED_IDS=$(printf '%s\n' "$ADDED_RAW" | sort -u)
+
+          # IDs already on main. The '|| true' is load-bearing: with pipefail, grep exits 1 when the
+          # repo has no migrations on main yet (its first migration, or no db/migrations dir), which
+          # would otherwise abort the script with no annotation. An empty set is the correct result.
+          EXISTING_IDS=$(
+            git ls-tree -r --name-only origin/main -- db/migrations \
+              | grep -E '\.sql$' | while IFS= read -r f; do id_of "$f"; done | sort -u \
+              || true
+          )
+
+          FAIL=0
+          # (a) a new ID that already exists on main (branched from stale main, or a concurrent PR's
+          #     ID already merged). Both inputs are sorted-unique, so intersect with comm.
+          CONFLICTS=$(comm -12 <(printf '%s\n' "$ADDED_IDS") <(printf '%s\n' "$EXISTING_IDS"))
+          if [ -n "$CONFLICTS" ]; then
+            while IFS= read -r id; do
+              echo "::error::Migration ID '$id' already exists on main. Renumber the new migration to the next free ID."
+            done <<< "$CONFLICTS"
+            FAIL=1
+          fi
+
+          # (b) two new migration files in this PR sharing one ID
+          DUP_IN_PR=$(printf '%s\n' "$ADDED_RAW" | sort | uniq -d)
+          if [ -n "$DUP_IN_PR" ]; then
+            echo "::error::Two new migrations in this PR share a migration ID: $(echo "$DUP_IN_PR" | tr '\n' ' ')"
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -eq 0 ]; then
+            echo "OK: $(printf '%s\n' "$ADDED_IDS" | wc -l) new migration ID(s) are unique vs main."
+          fi
+          exit $FAIL
+
       - name: Check migration immutability
         if: ${{ steps.detect.outputs.db_changed == 'true' && !inputs.skip-immutability-check }}
         run: |
