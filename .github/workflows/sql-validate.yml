@@ -146,41 +146,48 @@ jobs:
           set -euo pipefail
           id_of() { basename "$1" | sed -E 's/__.*//'; }
 
-          ADDED_IDS=$(
+          # Raw (non-unique) IDs this PR adds; the filename step already guaranteed each has '__',
+          # so id_of always yields a non-empty value.
+          ADDED_RAW=$(
             for f in $(git diff --name-only --diff-filter=A origin/main -- 'db/migrations/*.sql'); do
               id_of "$f"
-            done | sed '/^$/d'
+            done
           )
-          if [ -z "$ADDED_IDS" ]; then
+          if [ -z "$ADDED_RAW" ]; then
             echo "No new migrations -- nothing to check."
             exit 0
           fi
+          ADDED_IDS=$(printf '%s\n' "$ADDED_RAW" | sort -u)
 
+          # IDs already on main. The '|| true' is load-bearing: with pipefail, grep exits 1 when the
+          # repo has no migrations on main yet (its first migration, or no db/migrations dir), which
+          # would otherwise abort the script with no annotation. An empty set is the correct result.
           EXISTING_IDS=$(
             git ls-tree -r --name-only origin/main -- db/migrations \
-              | grep -E '\.sql$' | sed -E 's#.*/##; s/__.*//' | sort -u
+              | grep -E '\.sql$' | while IFS= read -r f; do id_of "$f"; done | sort -u \
+              || true
           )
 
           FAIL=0
-          # (a) a new ID that already exists on main (e.g. branched from stale main, or a concurrent
-          #     PR's ID already merged)
-          while IFS= read -r id; do
-            [ -n "$id" ] || continue
-            if printf '%s\n' "$EXISTING_IDS" | grep -qxF "$id"; then
+          # (a) a new ID that already exists on main (branched from stale main, or a concurrent PR's
+          #     ID already merged). Both inputs are sorted-unique, so intersect with comm.
+          CONFLICTS=$(comm -12 <(printf '%s\n' "$ADDED_IDS") <(printf '%s\n' "$EXISTING_IDS"))
+          if [ -n "$CONFLICTS" ]; then
+            while IFS= read -r id; do
               echo "::error::Migration ID '$id' already exists on main. Renumber the new migration to the next free ID."
-              FAIL=1
-            fi
-          done < <(printf '%s\n' "$ADDED_IDS" | sort -u)
+            done <<< "$CONFLICTS"
+            FAIL=1
+          fi
 
           # (b) two new migration files in this PR sharing one ID
-          DUP_IN_PR=$(printf '%s\n' "$ADDED_IDS" | sort | uniq -d)
+          DUP_IN_PR=$(printf '%s\n' "$ADDED_RAW" | sort | uniq -d)
           if [ -n "$DUP_IN_PR" ]; then
             echo "::error::Two new migrations in this PR share a migration ID: $(echo "$DUP_IN_PR" | tr '\n' ' ')"
             FAIL=1
           fi
 
           if [ "$FAIL" -eq 0 ]; then
-            echo "OK: $(printf '%s\n' "$ADDED_IDS" | sort -u | wc -l) new migration ID(s) are unique vs main."
+            echo "OK: $(printf '%s\n' "$ADDED_IDS" | wc -l) new migration ID(s) are unique vs main."
           fi
           exit $FAIL
 
