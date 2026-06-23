@@ -75,6 +75,7 @@ jobs:
         if: always()
         run: |
           dotnet tool update --global dotnet-reportgenerator-globaltool
+          export PATH="$PATH:$HOME/.dotnet/tools"
           reportgenerator \
             -reports:"./test-results/**/coverage.cobertura.xml" \
             -targetdir:"./coverage-report" \
