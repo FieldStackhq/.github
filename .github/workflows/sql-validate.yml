@@ -89,6 +89,10 @@ jobs:
           fi
           echo "event=$EVENT range='${RANGE:-<assume-changed>}' db_changed=$CHANGED"
           echo "db_changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          # Exported so the lint step scopes to the same change set this gate
+          # computed, rather than recomputing (and drifting from) it. Empty when
+          # no range was computable -- the lint step reads that as "lint everything".
+          echo "range=$RANGE" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         if: steps.detect.outputs.db_changed == 'true'
@@ -102,16 +106,90 @@ jobs:
 
       - name: Lint SQL files
         if: steps.detect.outputs.db_changed == 'true'
+        env:
+          RANGE: ${{ steps.detect.outputs.range }}
+        # Lint only the SQL files this change actually touches. Linting the whole
+        # db/ tree cost ~8 minutes on a ~850-file repo (sqlfluff is ~0.8s/file and
+        # single-process by default) to re-report thousands of pre-existing style
+        # warnings on files no PR touched. Scoped to a typical 1-5 file change it
+        # runs in ~2s.
+        #
+        # Deliberately NOT passing --processes: on a handful of files the process
+        # pool costs more to start than it saves (measured 3.4s vs 1.8s on 4
+        # files). It only pays off on a full-tree run.
+        #
+        # Note this stays non-gating (`|| true`), as before -- it emits
+        # annotations, it does not fail the build.
         run: |
-          if find db/ -name '*.sql' -type f | head -1 | grep -q .; then
-            sqlfluff lint db/ \
-              --dialect tsql \
-              --config db/.sqlfluff \
-              --format github-annotation-native \
-              || true
-          else
-            echo "No SQL files found -- skipping lint"
+          set -euo pipefail
+
+          SQL_PATHS=""
+          SCOPE=""
+
+          if [ -n "${RANGE:-}" ]; then
+            # $RANGE is intentionally unquoted: the push-event form is two
+            # arguments ("BEFORE SHA") and must word-split.
+            #
+            # Captured on its own line rather than inside `<(...)` with a blanket
+            # `|| true`. errexit does not propagate out of a process substitution,
+            # and a `|| true` spanning the whole pipeline would flatten a genuine
+            # `git diff` failure (e.g. an unfetched base ref) into an empty list --
+            # indistinguishable from an honest clean diff, on a non-gating step
+            # nobody would ever see it.
+            if DIFF_OUT=$(git diff --name-only --diff-filter=ACMRT $RANGE -- db/); then
+              # --diff-filter excludes deletions (D): a deleted .sql has no file to
+              # lint. grep's exit 1 (no .sql among the changed paths) is the only
+              # failure tolerated here.
+              SQL_PATHS=$(printf '%s\n' "$DIFF_OUT" | grep -E '\.sql$' | sort || true)
+              SCOPE="changed"
+            else
+              echo "::warning::git diff failed for range '$RANGE' -- falling back to a full-tree lint."
+              RANGE=""
+            fi
           fi
+
+          if [ -z "${RANGE:-}" ]; then
+            # No usable range (new branch / unknown base, or the diff above failed).
+            # Lint the full tree so a real change is never silently left unlinted.
+            echo "No usable diff range -- linting the full db/ tree."
+            if ! FIND_OUT=$(find db/ -name '*.sql' -type f); then
+              echo "::error::find failed enumerating db/ -- cannot determine what to lint."
+              exit 1
+            fi
+            SQL_PATHS=$(printf '%s\n' "$FIND_OUT" | sort)
+            SCOPE="full-tree"
+          fi
+
+          KEPT=()
+          if [ -n "$SQL_PATHS" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if [ "$SCOPE" = "full-tree" ]; then
+                # `find -type f` only yields paths that exist -- no stat needed.
+                KEPT+=("$f")
+              elif [ -f "$f" ]; then
+                # A rename can leave a path in the diff that is gone from disk.
+                KEPT+=("$f")
+              fi
+            done <<< "$SQL_PATHS"
+          fi
+
+          if [ ${#KEPT[@]} -eq 0 ]; then
+            echo "No SQL files to lint -- skipping."
+            exit 0
+          fi
+
+          echo "Linting ${#KEPT[@]} SQL file(s) [$SCOPE]:"
+          printf '  %s\n' "${KEPT[@]}"
+          # `--` fences the file list off from option parsing. Every path we build
+          # is 'db/'-prefixed so none can look like a flag today; the fence keeps
+          # that true if the pathspec is ever widened.
+          sqlfluff lint \
+            --dialect tsql \
+            --config db/.sqlfluff \
+            --format github-annotation-native \
+            -- "${KEPT[@]}" \
+            || true
 
       - name: Validate migration filenames (YYYYMMDD_PREFIX_NNN__description.sql)
         if: steps.detect.outputs.db_changed == 'true'
