@@ -269,6 +269,44 @@ jobs:
           fi
           exit $FAIL
 
+      - name: Check migration ID set is internally consistent (no duplicate IDs in the tree)
+        if: steps.detect.outputs.db_changed == 'true'
+        # Complements the vs-main check above, which compares only the IDs THIS PR adds against main
+        # as it is when the check runs. That misses the merge race: two PRs each branched from a main
+        # without the other's migration both pass, and whichever merges second lands a duplicate ID
+        # that surfaces only post-merge, when db-deploy builds the cross-repo manifest and aborts the
+        # deploy for EVERY environment ("Duplicate migration ID ... found in"). This step scans the
+        # whole checked-out tree instead of the PR's added set:
+        #   - on pull_request, actions/checkout resolves refs/pull/N/merge -- the PR merged into the
+        #     current base -- so a stale-branch collision shows up as a duplicate here and is caught
+        #     at PR time even though the added-vs-main diff cannot see it;
+        #   - on push to main, it catches an already-merged collision immediately, turning a silent
+        #     broken deploy into a red main within minutes instead of at the next deploy attempt.
+        # Pair with require-branches-up-to-date (or a merge queue) so a stale PR is re-validated
+        # against the updated base before merging; an --admin merge of a stale branch bypasses the PR
+        # run, leaving only the push-to-main run to catch it.
+        run: |
+          set -euo pipefail
+          # Migration ID = filename up to '__', matching db-deploy's ExtractMigrationId.
+          id_of() { basename "$1" | sed -E 's/__.*//'; }
+
+          ALL_FILES=$(git ls-tree -r --name-only HEAD -- db/migrations | grep -E '\.sql$' || true)
+          if [ -z "$ALL_FILES" ]; then
+            echo "No migrations in the tree -- nothing to check."
+            exit 0
+          fi
+
+          DUP_IDS=$(printf '%s\n' "$ALL_FILES" | while IFS= read -r f; do id_of "$f"; done | sort | uniq -d)
+          if [ -n "$DUP_IDS" ]; then
+            echo "::error::Duplicate migration ID(s) in db/migrations. db-deploy aborts at manifest collection, blocking every environment's deploy. Renumber so each ID is unique."
+            while IFS= read -r id; do
+              FILES=$(printf '%s\n' "$ALL_FILES" | grep -E "(^|/)${id}__" | tr '\n' ' ')
+              echo "::error::  ${id} is used by: ${FILES}"
+            done <<< "$DUP_IDS"
+            exit 1
+          fi
+          echo "OK: every migration ID in db/migrations is unique across the tree."
+
       - name: Check migration immutability
         if: ${{ steps.detect.outputs.db_changed == 'true' && !inputs.skip-immutability-check }}
         run: |
