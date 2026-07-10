@@ -287,7 +287,10 @@ jobs:
         # run, leaving only the push-to-main run to catch it.
         run: |
           set -euo pipefail
-          # Migration ID = filename up to '__', matching db-deploy's ExtractMigrationId.
+          # Migration ID = filename up to '__', matching db-deploy's ExtractMigrationId. A legacy
+          # file with no '__' (e.g. 20260320_001_replace_clr.sql) has no separator to strip, so its
+          # ID is the whole basename -- handled correctly below because matching is on the exact ID
+          # field, never on an "${id}__" pattern that such a filename can never contain.
           id_of() { basename "$1" | sed -E 's/__.*//'; }
 
           ALL_FILES=$(git ls-tree -r --name-only HEAD -- db/migrations | grep -E '\.sql$' || true)
@@ -296,11 +299,16 @@ jobs:
             exit 0
           fi
 
-          DUP_IDS=$(printf '%s\n' "$ALL_FILES" | while IFS= read -r f; do id_of "$f"; done | sort | uniq -d)
+          # Emit "<id>\t<path>" once per file, then work off that mapping. Deriving the ID and the
+          # file list from the same pass keeps the report robust to no-separator filenames and free
+          # of any grep whose non-zero exit could trip set -e mid-loop.
+          PAIRS=$(printf '%s\n' "$ALL_FILES" | while IFS= read -r f; do printf '%s\t%s\n' "$(id_of "$f")" "$f"; done)
+
+          DUP_IDS=$(printf '%s\n' "$PAIRS" | cut -f1 | sort | uniq -d)
           if [ -n "$DUP_IDS" ]; then
             echo "::error::Duplicate migration ID(s) in db/migrations. db-deploy aborts at manifest collection, blocking every environment's deploy. Renumber so each ID is unique."
             while IFS= read -r id; do
-              FILES=$(printf '%s\n' "$ALL_FILES" | grep -E "(^|/)${id}__" | tr '\n' ' ')
+              FILES=$(printf '%s\n' "$PAIRS" | awk -F'\t' -v id="$id" '$1 == id { printf "%s ", $2 }')
               echo "::error::  ${id} is used by: ${FILES}"
             done <<< "$DUP_IDS"
             exit 1
