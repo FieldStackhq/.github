@@ -24,8 +24,9 @@ on:
         default: 'FullyQualifiedName~UnitTests'
       fail-on-no-tests:
         description: >-
-          Fail the job when a test leg matches zero tests. Off by default so existing consumers are
-          unaffected; turn it on to make a mis-scoped filter loud instead of green.
+          Fail the job when a test leg matches zero tests across every assembly. Off by default so
+          existing consumers are unaffected; turn it on to make a mis-scoped filter loud instead of
+          green.
         required: false
         type: boolean
         default: false
@@ -63,6 +64,58 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
+      # One implementation, used by both legs. Written to disk rather than duplicated inline, and
+      # rather than extracted to a composite action: a reusable workflow cannot reference a local
+      # action from its OWN repository with `uses: ./...` (that path resolves against the caller's
+      # checkout), so a composite action here would have to be referenced as
+      # FieldStackHQ/.github/...@main and would not exist on main while this branch is under review.
+      - name: Install test-leg reporter
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci"
+          cat > "$RUNNER_TEMP/ci/report-leg.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          # usage: report-leg.sh <leg-name> <output-file> <filter> <fail-on-no-tests>
+          #
+          # Reports what a test leg actually covered, and fails only when it covered NOTHING.
+          #
+          # Deliberately not per-assembly. A filter's job is to select a subset, so assemblies that
+          # match nothing are normal: on a correctly-scoped unit leg in fieldstack-identity, 5
+          # assemblies run and 2 (the integration and end-to-end projects) match nothing by design.
+          # Failing per-assembly would fire on every correct run in every repo, and the guard would
+          # be switched off within a week. Total-zero is the condition that always means "this
+          # verified nothing"; the per-leg counts below make a PARTIAL mis-scope visible to a human
+          # without inventing a rule the workflow cannot know.
+          set -uo pipefail
+          LEG="$1"; OUT="$2"; FILTER="$3"; FAIL_ON_NO_TESTS="$4"
+
+          # grep -c exits non-zero on zero matches, which set -e would treat as fatal; the counts
+          # are still correct, so swallow the status rather than the number.
+          ran=$(grep -cE '^(Passed|Failed)!' "$OUT" || true)
+          unmatched=$(grep -c 'No test matches' "$OUT" || true)
+          total=$(grep -oE 'Total: *[0-9]+' "$OUT" | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+
+          {
+            echo "### ${LEG} tests"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| filter | \`${FILTER}\` |"
+            echo "| assemblies with matching tests | ${ran} |"
+            echo "| assemblies matching nothing | ${unmatched} |"
+            echo "| tests run | ${total} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${ran:-0}" -eq 0 ]; then
+            if [ "$FAIL_ON_NO_TESTS" = "true" ]; then
+              echo "::error::${LEG} filter '${FILTER}' matched no tests in any assembly. Nothing was verified."
+              exit 1
+            fi
+            echo "::warning::${LEG} filter '${FILTER}' matched no tests in any assembly -- this leg verified nothing. Override the unit-test-filter input to match this repo's test project naming."
+          fi
+          SCRIPT
+          chmod +x "$RUNNER_TEMP/ci/report-leg.sh"
+
       # Unit tests - always run, fast
       - name: Run unit tests
         env:
@@ -75,17 +128,7 @@ jobs:
             --logger "trx;LogFileName=unit-results.trx" \
             --collect:"XPlat Code Coverage" \
             --results-directory ./test-results/unit 2>&1 | tee ./unit-output.txt
-
-          # `dotnet test` exits 0 when a filter selects no tests, so a mis-scoped filter is
-          # indistinguishable from a passing run by exit code alone. A per-assembly summary line is
-          # printed only when tests actually ran, so its absence means the leg matched nothing.
-          if ! grep -qE '^(Passed|Failed)!' ./unit-output.txt; then
-            if [ "$FAIL_ON_NO_TESTS" = "true" ]; then
-              echo "::error::Unit test filter '$UNIT_FILTER' matched no tests. Nothing was verified."
-              exit 1
-            fi
-            echo "::warning::Unit test filter '$UNIT_FILTER' matched no tests -- this leg verified nothing. Override the unit-test-filter input to match this repo's test project naming."
-          fi
+          "$RUNNER_TEMP/ci/report-leg.sh" "Unit" ./unit-output.txt "$UNIT_FILTER" "$FAIL_ON_NO_TESTS"
 
       # Integration tests - optional, requires Docker
       - name: Run integration tests
@@ -104,14 +147,7 @@ jobs:
             --logger "trx;LogFileName=integration-results.trx" \
             --collect:"XPlat Code Coverage" \
             --results-directory ./test-results/integration 2>&1 | tee ./integration-output.txt
-
-          if ! grep -qE '^(Passed|Failed)!' ./integration-output.txt; then
-            if [ "$FAIL_ON_NO_TESTS" = "true" ]; then
-              echo "::error::Integration test filter '$FILTER' matched no tests. Nothing was verified."
-              exit 1
-            fi
-            echo "::warning::Integration test filter '$FILTER' matched no tests -- this leg verified nothing."
-          fi
+          "$RUNNER_TEMP/ci/report-leg.sh" "Integration" ./integration-output.txt "$FILTER" "$FAIL_ON_NO_TESTS"
 
       # Coverage report
       - name: Generate coverage report
