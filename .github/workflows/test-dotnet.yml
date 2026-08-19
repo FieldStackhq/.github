@@ -9,10 +9,26 @@ on:
         type: string
         default: '8.0.x'
       test-filter:
-        description: 'dotnet test --filter expression (e.g., Category=Unit)'
+        description: 'Extra --filter expression ANDed onto the integration test run (e.g., Category=Unit)'
         required: false
         type: string
         default: ''
+      unit-test-filter:
+        description: >-
+          --filter expression selecting the unit test run. Defaults to the repo-template convention
+          (test projects named *.UnitTests). Repos whose test projects are named differently MUST
+          override this, or the unit leg silently matches nothing -- dotnet test exits 0 when a
+          filter selects no tests, so the job still reports success.
+        required: false
+        type: string
+        default: 'FullyQualifiedName~UnitTests'
+      fail-on-no-tests:
+        description: >-
+          Fail the job when a test leg matches zero tests. Off by default so existing consumers are
+          unaffected; turn it on to make a mis-scoped filter loud instead of green.
+        required: false
+        type: boolean
+        default: false
       run-integration-tests:
         description: 'Run integration tests (requires Docker for Testcontainers)'
         required: false
@@ -49,26 +65,53 @@ jobs:
 
       # Unit tests - always run, fast
       - name: Run unit tests
+        env:
+          UNIT_FILTER: ${{ inputs.unit-test-filter }}
+          FAIL_ON_NO_TESTS: ${{ inputs.fail-on-no-tests }}
         run: |
+          set -o pipefail
           dotnet test --no-build --configuration Release \
-            --filter "FullyQualifiedName~UnitTests" \
+            --filter "$UNIT_FILTER" \
             --logger "trx;LogFileName=unit-results.trx" \
             --collect:"XPlat Code Coverage" \
-            --results-directory ./test-results/unit
+            --results-directory ./test-results/unit 2>&1 | tee ./unit-output.txt
+
+          # `dotnet test` exits 0 when a filter selects no tests, so a mis-scoped filter is
+          # indistinguishable from a passing run by exit code alone. A per-assembly summary line is
+          # printed only when tests actually ran, so its absence means the leg matched nothing.
+          if ! grep -qE '^(Passed|Failed)!' ./unit-output.txt; then
+            if [ "$FAIL_ON_NO_TESTS" = "true" ]; then
+              echo "::error::Unit test filter '$UNIT_FILTER' matched no tests. Nothing was verified."
+              exit 1
+            fi
+            echo "::warning::Unit test filter '$UNIT_FILTER' matched no tests -- this leg verified nothing. Override the unit-test-filter input to match this repo's test project naming."
+          fi
 
       # Integration tests - optional, requires Docker
       - name: Run integration tests
         if: inputs.run-integration-tests
+        env:
+          EXTRA_FILTER: ${{ inputs.test-filter }}
+          FAIL_ON_NO_TESTS: ${{ inputs.fail-on-no-tests }}
         run: |
+          set -o pipefail
           FILTER="FullyQualifiedName~IntegrationTests"
-          if [ -n "${{ inputs.test-filter }}" ]; then
-            FILTER="${FILTER}&${{ inputs.test-filter }}"
+          if [ -n "$EXTRA_FILTER" ]; then
+            FILTER="${FILTER}&${EXTRA_FILTER}"
           fi
           dotnet test --no-build --configuration Release \
             --filter "$FILTER" \
             --logger "trx;LogFileName=integration-results.trx" \
             --collect:"XPlat Code Coverage" \
-            --results-directory ./test-results/integration
+            --results-directory ./test-results/integration 2>&1 | tee ./integration-output.txt
+
+          if ! grep -qE '^(Passed|Failed)!' ./integration-output.txt; then
+            if [ "$FAIL_ON_NO_TESTS" = "true" ]; then
+              echo "::error::Integration test filter '$FILTER' matched no tests. Nothing was verified."
+              exit 1
+            fi
+            echo "::warning::Integration test filter '$FILTER' matched no tests -- this leg verified nothing."
+          fi
 
       # Coverage report
       - name: Generate coverage report
