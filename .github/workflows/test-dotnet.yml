@@ -9,10 +9,27 @@ on:
         type: string
         default: '8.0.x'
       test-filter:
-        description: 'dotnet test --filter expression (e.g., Category=Unit)'
+        description: 'Extra --filter expression ANDed onto the integration test run (e.g., Category=Unit)'
         required: false
         type: string
         default: ''
+      unit-test-filter:
+        description: >-
+          --filter expression selecting the unit test run. Defaults to the repo-template convention
+          (test projects named *.UnitTests). Repos whose test projects are named differently MUST
+          override this, or the unit leg silently matches nothing -- dotnet test exits 0 when a
+          filter selects no tests, so the job still reports success.
+        required: false
+        type: string
+        default: 'FullyQualifiedName~UnitTests'
+      fail-on-no-tests:
+        description: >-
+          Fail the job when a test leg matches zero tests across every assembly. Off by default so
+          existing consumers are unaffected; turn it on to make a mis-scoped filter loud instead of
+          green.
+        required: false
+        type: boolean
+        default: false
       run-integration-tests:
         description: 'Run integration tests (requires Docker for Testcontainers)'
         required: false
@@ -47,28 +64,90 @@ jobs:
       - name: Build
         run: dotnet build --no-restore --configuration Release
 
+      # One implementation, used by both legs. Written to disk rather than duplicated inline, and
+      # rather than extracted to a composite action: a reusable workflow cannot reference a local
+      # action from its OWN repository with `uses: ./...` (that path resolves against the caller's
+      # checkout), so a composite action here would have to be referenced as
+      # FieldStackHQ/.github/...@main and would not exist on main while this branch is under review.
+      - name: Install test-leg reporter
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci"
+          cat > "$RUNNER_TEMP/ci/report-leg.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          # usage: report-leg.sh <leg-name> <output-file> <filter> <fail-on-no-tests>
+          #
+          # Reports what a test leg actually covered, and fails only when it covered NOTHING.
+          #
+          # Deliberately not per-assembly. A filter's job is to select a subset, so assemblies that
+          # match nothing are normal: on a correctly-scoped unit leg in fieldstack-identity, 5
+          # assemblies run and 2 (the integration and end-to-end projects) match nothing by design.
+          # Failing per-assembly would fire on every correct run in every repo, and the guard would
+          # be switched off within a week. Total-zero is the condition that always means "this
+          # verified nothing"; the per-leg counts below make a PARTIAL mis-scope visible to a human
+          # without inventing a rule the workflow cannot know.
+          set -uo pipefail
+          LEG="$1"; OUT="$2"; FILTER="$3"; FAIL_ON_NO_TESTS="$4"
+
+          # grep -c exits non-zero on zero matches, which set -e would treat as fatal; the counts
+          # are still correct, so swallow the status rather than the number.
+          ran=$(grep -cE '^(Passed|Failed)!' "$OUT" || true)
+          unmatched=$(grep -c 'No test matches' "$OUT" || true)
+          total=$(grep -oE 'Total: *[0-9]+' "$OUT" | grep -oE '[0-9]+' | awk '{s+=$1} END {print s+0}')
+
+          {
+            echo "### ${LEG} tests"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| filter | \`${FILTER}\` |"
+            echo "| assemblies with matching tests | ${ran} |"
+            echo "| assemblies matching nothing | ${unmatched} |"
+            echo "| tests run | ${total} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${ran:-0}" -eq 0 ]; then
+            if [ "$FAIL_ON_NO_TESTS" = "true" ]; then
+              echo "::error::${LEG} filter '${FILTER}' matched no tests in any assembly. Nothing was verified."
+              exit 1
+            fi
+            echo "::warning::${LEG} filter '${FILTER}' matched no tests in any assembly -- this leg verified nothing. Override the unit-test-filter input to match this repo's test project naming."
+          fi
+          SCRIPT
+          chmod +x "$RUNNER_TEMP/ci/report-leg.sh"
+
       # Unit tests - always run, fast
       - name: Run unit tests
+        env:
+          UNIT_FILTER: ${{ inputs.unit-test-filter }}
+          FAIL_ON_NO_TESTS: ${{ inputs.fail-on-no-tests }}
         run: |
+          set -o pipefail
           dotnet test --no-build --configuration Release \
-            --filter "FullyQualifiedName~UnitTests" \
+            --filter "$UNIT_FILTER" \
             --logger "trx;LogFileName=unit-results.trx" \
             --collect:"XPlat Code Coverage" \
-            --results-directory ./test-results/unit
+            --results-directory ./test-results/unit 2>&1 | tee ./unit-output.txt
+          "$RUNNER_TEMP/ci/report-leg.sh" "Unit" ./unit-output.txt "$UNIT_FILTER" "$FAIL_ON_NO_TESTS"
 
       # Integration tests - optional, requires Docker
       - name: Run integration tests
         if: inputs.run-integration-tests
+        env:
+          EXTRA_FILTER: ${{ inputs.test-filter }}
+          FAIL_ON_NO_TESTS: ${{ inputs.fail-on-no-tests }}
         run: |
+          set -o pipefail
           FILTER="FullyQualifiedName~IntegrationTests"
-          if [ -n "${{ inputs.test-filter }}" ]; then
-            FILTER="${FILTER}&${{ inputs.test-filter }}"
+          if [ -n "$EXTRA_FILTER" ]; then
+            FILTER="${FILTER}&${EXTRA_FILTER}"
           fi
           dotnet test --no-build --configuration Release \
             --filter "$FILTER" \
             --logger "trx;LogFileName=integration-results.trx" \
             --collect:"XPlat Code Coverage" \
-            --results-directory ./test-results/integration
+            --results-directory ./test-results/integration 2>&1 | tee ./integration-output.txt
+          "$RUNNER_TEMP/ci/report-leg.sh" "Integration" ./integration-output.txt "$FILTER" "$FAIL_ON_NO_TESTS"
 
       # Coverage report
       - name: Generate coverage report
