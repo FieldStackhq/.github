@@ -150,6 +150,8 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+          # Deliberately NOT a workflow input -- see the reasoning at the check that reads it.
+          EXPECTED_GUARD_REPO: 'FieldStackhq/fieldstack-dev-skills'
         run: |
           # `-e` is ALREADY ON. GitHub runs a `shell: bash` step as
           #   bash --noprofile --norc -eo pipefail {0}
@@ -297,8 +299,46 @@ jobs:
 
           # Both halves are validated before they reach actions/checkout, because both are
           # read from a file and neither is a value this workflow chose.
-          if ! printf '%s' "$GUARD_REPO" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
-            echo "::error::The repository half of fieldstack.standardsGuardRef ('$GUARD_REPO') is not a plain owner/repo (read from $PIN_SOURCE)."
+          #
+          # THE REPOSITORY IS PINNED TO A CONSTANT, and this is the one place where the PORT is
+          # less safe than the script it came from unless it is.
+          #
+          # check-sql-standards.sh ran in ONE repo with THAT repo's own credential: the pin and the
+          # token were 1:1, so "the pin names some repository" was bounded by "whoever can commit
+          # here already has this repo". A reusable org workflow breaks that pairing. One shared
+          # ORCHESTRATOR_PAT now rides along with every calling repo, including the lowest-trust one
+          # in the org, and `GUARD_REPO` feeds `actions/checkout`'s `repository:` directly -- after
+          # which this job EXECUTES what was checked out, as `node .guard/guard/index.mjs`, on a
+          # persistent self-hosted runner.
+          #
+          # Reading the pin from the base rather than the working tree (above) stops a pull request
+          # from choosing its own guard. It does not stop someone who can land a commit on a
+          # consuming repo's DEFAULT BRANCH, because the default branch is the base. A shape check
+          # accepts any well-formed owner/repo from that file. So the shape check is not enough here
+          # even though the identical line was enough there.
+          #
+          # A CONSTANT, deliberately, and not either softer option:
+          #
+          #   - A `workflow_call` input with a default. The CALLER's workflow file sets that, and the
+          #     caller's workflow file sits in the same repo, on the same branch, behind the same
+          #     commit access as the package.json this check exists not to trust. It moves the value
+          #     without moving the trust.
+          #   - An allowlist. Defensible when a second guard exists. Today none does, so it is this
+          #     constant with somewhere convenient to add a second entry later without review.
+          #
+          # This pins WHICH REPOSITORY, never which version. The ref half still comes from the
+          # consumer's package.json and is still required to be a 40-hex commit SHA below -- a
+          # consumer chooses which commit of the trusted guard it enforces, which is the entire
+          # design and must not be narrowed by this check.
+          # Compared CASE-INSENSITIVELY. GitHub owner and repository names are case-insensitive and
+          # resolve to the same repository, so an exact match would reject a correct pin over its
+          # spelling -- and both spellings are in live use: this org's own workflows contain
+          # FieldStackHQ three times and FieldStackhq twice, while the one existing consumer pins
+          # the lowercase form. An exact test would have rejected the majority spelling for naming
+          # the right repository. Folding case costs nothing here, because the two forms are the
+          # same repository to GitHub and therefore the same trust decision.
+          if [ "${GUARD_REPO,,}" != "${EXPECTED_GUARD_REPO,,}" ]; then
+            echo "::error::fieldstack.standardsGuardRef names the repository '$GUARD_REPO' (read from $PIN_SOURCE), but this workflow only runs the guard from '$EXPECTED_GUARD_REPO'. It checks that repository out with a shared org credential and then executes it, so the repository is fixed here rather than taken from the calling repo. Change the ref half to pin a different guard version; the repository half is not configurable."
             exit 1
           fi
 
