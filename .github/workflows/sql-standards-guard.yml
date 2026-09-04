@@ -1,0 +1,726 @@
+name: SQL Standards Guard (Reusable)
+
+# The CI half of the FieldStack standards guard, for every repo in the org.
+#
+# This workflow resolves WHICH files to check and WHICH version of the rules to enforce.
+# It contains no rules. The rules live in fieldstack-dev-skills beside the `writing-sql`
+# skill they enforce, reviewed in the same pull request, so the detector and the doctrine
+# cannot drift into two different standards. A consumer pins a version and invokes this;
+# it never restates a rule.
+#
+# Adopting it, in full:
+#
+#   jobs:
+#     sql-standards:
+#       uses: FieldStackHQ/.github/.github/workflows/sql-standards-guard.yml@main
+#       secrets:
+#         ORCHESTRATOR_PAT: ${{ secrets.ORCHESTRATOR_PAT }}
+#
+# plus one key in the consumer's package.json:
+#
+#   "fieldstack": {
+#     "standardsGuardRef": "github:FieldStackhq/fieldstack-dev-skills#<40-char commit sha>"
+#   }
+#
+# The same key is what the pre-commit half (lint-staged -> guard-local.mjs) and the
+# plugin's PreToolUse hook read, so all three triggers share one implementation and one
+# version per repo.
+#
+# Relationship to fieldstack-service-hub/.github/scripts/check-sql-standards.sh: that
+# script is the reference implementation this is modelled on, and it remains the more
+# heavily tested one -- it has a harness (check-sql-standards.test.sh) that runs on every
+# pull request there. This workflow is a port of its behaviour into a form the other
+# repos can adopt with a `uses:` line and no scripts of their own. Where the two disagree,
+# the script is the older and better-proven text; the differences are called out inline
+# below (a stricter pin format, and a refusal to run on pull_request_target).
+#
+# Relationship to sql-validate.yml, the org's other SQL check: that one lints style with
+# sqlfluff and validates migration filenames, and it is deliberately non-gating. This one
+# guards how SQL is written at all -- transactions, index DDL, protected POS/checkout
+# objects -- and it FAILS the job. Different standards, different failure modes; a caller
+# normally wants both.
+
+on:
+  workflow_call:
+    inputs:
+      package-json-path:
+        description: >-
+          Path, relative to the repository root, of the package.json carrying
+          fieldstack.standardsGuardRef.
+        required: false
+        type: string
+        default: 'package.json'
+      node-version:
+        description: 'Node version used to run the guard. The guard is dependency-free ESM.'
+        required: false
+        type: string
+        default: '20'
+      guard-timeout-seconds:
+        description: >-
+          Per-invocation timeout for the guard. Every call is bounded: without this a
+          stalled guard holds a self-hosted runner slot until the job timeout kills it,
+          with no diagnosis at all.
+        required: false
+        type: number
+        default: 300
+    secrets:
+      ORCHESTRATOR_PAT:
+        description: >-
+          Token with read access to the PRIVATE fieldstack-dev-skills repository. Used by
+          actions/checkout for one git fetch and nothing else. Required: without it the
+          guard cannot be resolved and the gate cannot run, which this workflow reports as
+          a hard failure rather than a pass.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sql-standards:
+    name: sql-standards
+    runs-on: [self-hosted, linux, x64]
+    # A BOUND ON THE WHOLE JOB, not only on the guard call.
+    #
+    # `guard-timeout-seconds` exists because a stalled guard holds a self-hosted runner slot with no
+    # diagnosis. That danger is not unique to the guard: the root `actions/checkout` fetches full
+    # history, `setup-node` pulls a toolchain, the cross-repo checkout reaches another repository
+    # over the network, and each `git show` and `node` call in the resolve step is unbounded. Every
+    # one of them can hang, and without this the job would sit on a shared runner for GitHub's
+    # 360-minute default before anyone learned anything.
+    #
+    # It does NOT replace the per-call timeout, and the difference is the point: a job timeout kills
+    # the runner slot and tells you nothing, while `timeout` around the guard exits 124, which this
+    # workflow catches and reports as a TOOLING failure rather than a SQL violation. The inner bound
+    # diagnoses; this one is the backstop for everything it cannot see.
+    #
+    # COUPLED to GUARD_BUDGET_SECONDS in the check step, which stops the guard at 1200s so the
+    # pile-up of many in-limit batches reports itself instead of being killed here with no
+    # diagnosis. That coupling cannot be enforced -- this is YAML the shell cannot read -- so it is
+    # stated at both ends. If one moves, move the other.
+    timeout-minutes: 30
+    steps:
+      - name: Clean workspace (self-hosted pre-run maintenance)
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: sudo find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || echo "::warning::Workspace cleanup failed; this job may be running against stale files from a previous job."
+
+      # This job runs third-party code -- the guard, checked out from another repository --
+      # inside the caller's workspace. persist-credentials: false keeps the caller's
+      # GITHUB_TOKEN out of .git/config while that happens. Nothing here needs it: the diff
+      # range is computed from refs the checkout already fetched.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # DIFFERENT from check-sql-standards.sh, deliberately.
+      #
+      # This job is handed a cross-repo PAT. Under pull_request_target that PAT would be
+      # available to a job whose checked-out head is a fork's, which is the standard route
+      # to exfiltrating an org credential. The gate refuses rather than trusting a caller
+      # to have thought about it -- a reusable workflow cannot see how it was wired in.
+      #
+      # Its own step, and a message, because `on:` in the CALLER is where this gets set and
+      # a bare failure would send whoever hits it looking in the wrong file.
+      - name: Refuse to run on pull_request_target
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          if [ "${EVENT:-}" = "pull_request_target" ]; then
+            echo "::error::This workflow must not be called from a pull_request_target trigger. It is handed a cross-repository token (ORCHESTRATOR_PAT), and pull_request_target exposes that token to a job whose head commit is untrusted. Call it from pull_request instead."
+            exit 1
+          fi
+          echo "Trigger '${EVENT:-<unset>}' is acceptable."
+
+      # The `secrets` context is NOT available in a step-level `if:` -- using it there makes
+      # GitHub reject the whole workflow file, which fails in 0s with no jobs and no log.
+      # It IS available in `env:`, which is why this is a step that reads an env var rather
+      # than a condition.
+      #
+      # `required: true` above already makes GitHub reject a caller that omits the secret,
+      # but a caller can pass one that resolves to the empty string. That case reaches
+      # actions/checkout as an anonymous fetch of a private repository and surfaces as a
+      # "repository not found" 404 -- a message that reads like a wrong ref rather than a
+      # missing credential.
+      - name: Verify the guard credential is present
+        shell: bash
+        env:
+          GUARD_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
+        run: |
+          set -uo pipefail
+          if [ -z "${GUARD_TOKEN:-}" ]; then
+            echo "::error::ORCHESTRATOR_PAT was passed but is empty. fieldstack-dev-skills is a private repository, so the guard cannot be checked out without it and this gate cannot run. Failing rather than passing: a gate that did not run is not a gate that found nothing."
+            exit 1
+          fi
+          echo "Guard credential present."
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Resolve the pinned guard ref
+        id: guard-ref
+        shell: bash
+        env:
+          # The trigger, because the commit graph cannot tell a pull_request merge ref from an
+          # ordinary merge commit on a branch -- see the range resolution below.
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
+          # Deliberately NOT a workflow input -- see the reasoning at the check that reads it.
+          EXPECTED_GUARD_REPO: 'FieldStackhq/fieldstack-dev-skills'
+        run: |
+          # `-e` is ALREADY ON. GitHub runs a `shell: bash` step as
+          #   bash --noprofile --norc -eo pipefail {0}
+          # and the `set` below does not remove it. Everything here is written to survive
+          # errexit -- in particular there is no bare `[ cond ] && cmd` statement anywhere,
+          # because when the test is false that list exits 1 and errexit kills the step.
+          set -uo pipefail
+
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+
+          # --- Resolve the diff range ------------------------------------------------
+          # Deliberately NOT fail-open and NOT silently fail-closed. A gate that cannot see
+          # what changed must say so: "nothing to check" and "could not tell what changed"
+          # produce the same green tick otherwise, and a silent pass is the exact failure
+          # this gate exists to prevent, one floor down.
+          #
+          # RANGE is carried to the run step as an output rather than recomputed there.
+          # Two computations of the same range are two answers waiting to diverge.
+          RANGE=""
+          BASE_REF=""
+          # GATED ON THE EVENT, not on the shape of HEAD.
+          #
+          # This branch used to fire whenever `HEAD^2` resolved -- that is, whenever HEAD had two
+          # parents. That is true of GitHub's pull_request merge ref, which is what it was written
+          # for. It is equally true of HEAD after an ordinary PUSH of a merge commit, which is
+          # exactly what `main` looks like in any repo using GitHub's default merge strategy.
+          #
+          # The push path below is reachable -- it is a supported fallback -- so on a push whose HEAD
+          # happened to be a merge commit, this branch won the race and computed HEAD^1...HEAD^2:
+          # the contents of that ONE merge, not what the push contained. A push carrying several
+          # commits would have had the rest silently excluded from the diff, and the gate would have
+          # reported clean on SQL it never looked at. That is the same failure this whole step is
+          # written to avoid, arriving through the branch meant to prevent it.
+          #
+          # `github.event_name` is the only thing that actually distinguishes the two, because the
+          # commit graph cannot: a merge ref and a merged main are the same shape.
+          if [ "${EVENT_NAME:-}" = "pull_request" ] && git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1; then
+            # On pull_request, checkout leaves HEAD at the merge commit: HEAD^1 is the base
+            # tip and HEAD^2 the pull request head. Three dots gives exactly what changed.
+            RANGE='HEAD^1...HEAD^2'
+            BASE_REF='HEAD^1'
+          elif [ -n "${BASE_SHA:-}" ]; then
+            RANGE="${BASE_SHA}...HEAD"
+            BASE_REF="$BASE_SHA"
+          elif [ -n "${PUSH_BEFORE:-}" ] \
+               && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            RANGE="${PUSH_BEFORE}...HEAD"
+            BASE_REF="$PUSH_BEFORE"
+          else
+            echo "::error::Could not resolve a diff range for event '${EVENT_NAME:-<unset>}' (no pull_request merge ref, no pull_request base sha, no usable push 'before'), so no SQL was checked. This is a hard failure rather than a pass. Call this workflow from a pull_request trigger, and check out with fetch-depth: 0."
+            exit 1
+          fi
+
+          # --- Resolve the pinned guard ----------------------------------------------
+          # Read from the BASE of the diff, NEVER from the working tree.
+          #
+          # package.json is a file the pull request under review is free to edit, and its
+          # value chooses which code this job then executes inside a check that can block a
+          # merge. A working-tree read would let anyone able to push to the branch point the
+          # gate at code of their choosing, in the same diff the gate is meant to be
+          # policing, and it would go green whatever the SQL said.
+          #
+          # Reading from the base also gives a version bump the right semantics: a pull
+          # request that raises the pin is checked by the PREVIOUS guard, and the new one
+          # takes effect once that pull request has been reviewed and merged.
+          PKG_PATH="${PACKAGE_JSON_PATH:-package.json}"
+
+          fail_pin() {
+            echo "::error::$1 The SQL standards gate cannot run without knowing which version of the rules to enforce, and passing here would be a false green. Details follow."
+            cat "$tmp/err" >&2 || true
+            exit 1
+          }
+
+          # The read is split in two on purpose: fetch the blob, then parse it.
+          #
+          # A single `git show ... | node` pipeline reports NODE's status, and the parser
+          # below exits 0 for a file that simply carries no pin. So a `git show` failure of
+          # any kind -- a bad ref, a shallow or corrupted fetch -- produced exactly the same
+          # empty result as the one case the bootstrap branch exists for, and every one of
+          # them fell through to reading the pull request's own tree. That is the trap door
+          # the base read exists to remove.
+          #
+          # Only a CLEAN read of a base that has no pin may bootstrap. A failed read is a
+          # hard failure.
+          #
+          #   $1 the <ref>:<path> to read   $2 clause naming what could not be read
+          read_pin() {
+            local src="$1" what="$2" rc=0
+            if ! git show "$src" > "$tmp/pkg.json" 2>>"$tmp/err"; then
+              fail_pin "$what could not be read at all."
+            fi
+            # Exit 0 with output -- the pin, read cleanly.
+            # Exit 0 with nothing -- valid JSON carrying no pin. The bootstrap case.
+            # Exit 2 -- not usable JSON at all.
+            #
+            # The third status is the one that is easy to miss. A malformed package.json that
+            # threw, was caught, and exited 0 with empty stdout would be indistinguishable
+            # from "this base predates the gate", so a corrupt file would bootstrap off the
+            # pull request's own tree.
+            #
+            # The lookup is optional-chained rather than inside the same try: a missing
+            # `fieldstack` key is a legitimate no-pin file, not a corrupt one.
+            GUARD_PKG=$(node -e '
+              let s = "";
+              process.stdin.on("data", (d) => (s += d)).on("end", () => {
+                let doc;
+                try {
+                  doc = JSON.parse(s);
+                } catch (e) {
+                  process.stderr.write(String((e && e.message) || e));
+                  process.exit(2);
+                }
+                const r = doc && doc.fieldstack && doc.fieldstack.standardsGuardRef;
+                if (r) process.stdout.write(String(r));
+              });
+            ' < "$tmp/pkg.json" 2>>"$tmp/err") || rc=$?
+            # ANY non-zero status, not just the 2 the parser raises for bad JSON. A missing
+            # node binary, a crash, a stream error or a runner out of resources all exit
+            # non-zero with empty stdout, and testing for a specific code would let every one
+            # of them look like "no pin here". The test is "did the read succeed", which
+            # cannot grow a fourth way to be wrong.
+            if [ "$rc" -ne 0 ]; then
+              fail_pin "$what could not be parsed -- the read exited $rc."
+            fi
+          }
+
+          GUARD_PKG=""
+          read_pin "$BASE_REF:$PKG_PATH" "$PKG_PATH on the base of this diff ($BASE_REF). This is NOT treated as a bootstrap: falling back to the pull request's own tree on a failed base read would hand the choice of guard back to the diff under review, and the base"
+          PIN_SOURCE="$BASE_REF"
+
+          # THERE IS NO BOOTSTRAP FALLBACK, and its removal is the point of this block.
+          #
+          # There was one: if the base carried no pin, the ref was read from HEAD instead, with a
+          # comment asserting the branch "cannot be reached afterwards... because a pull request
+          # cannot rewrite its own base". That reasoning holds only while the base actually carries
+          # the key. It says nothing about a repo where the key never landed, or where a later merge
+          # dropped it -- and in that repo EVERY pull request finds an empty base pin, takes the
+          # fallback, and chooses its own guard commit from its own tree.
+          #
+          # So the branch was not one-time. It was the DEFAULT for any repo missing the key, which is
+          # exactly the population least likely to notice. A "one-time" exception entered whenever a
+          # value is absent is not an exception; it is the behaviour, and a `::warning::` on a run
+          # nobody reads does not change that.
+          #
+          # This is the same class as the repository pin one commit earlier -- a value the calling
+          # repo controls deciding what code this job executes -- and fixing the repository half
+          # while leaving the ref half open is a fix that reached one door and not its twin, in the
+          # same file. Deleting the branch closes the class rather than adding a third check to it.
+          #
+          # The cost is real and is the right trade: adopting this gate is TWO steps, not one. Land
+          # `fieldstack.standardsGuardRef` on the default branch first, then add the `uses:` line.
+          # The failure message below says so, because the alternative is an onboarding error that
+          # reads like a bug in the gate.
+          if [ -z "$GUARD_PKG" ]; then
+            fail_pin "No fieldstack.standardsGuardRef in $PKG_PATH on the base of this diff ($BASE_REF). The ref is read from the BASE and never from the pull request's own tree, so it must already be on the default branch before this workflow can run. Adopting this gate is two steps: first merge a change adding the fieldstack.standardsGuardRef key, then add the uses: line that calls this workflow."
+          fi
+
+          # --- Split and validate ------------------------------------------------------
+          # `github:owner/repo#committish` -> the two halves actions/checkout wants.
+          case "$GUARD_PKG" in
+            github:*/*#*) ;;
+            *)
+              echo "::error::fieldstack.standardsGuardRef is '$GUARD_PKG', which is not of the form github:owner/repo#<sha> (read from $PIN_SOURCE)."
+              exit 1
+              ;;
+          esac
+          GUARD_REPO="${GUARD_PKG#github:}"
+          GUARD_REPO="${GUARD_REPO%%#*}"
+          GUARD_SHA="${GUARD_PKG##*#}"
+
+          # Both halves are validated before they reach actions/checkout, because both are
+          # read from a file and neither is a value this workflow chose.
+          #
+          # THE REPOSITORY IS PINNED TO A CONSTANT, and this is the one place where the PORT is
+          # less safe than the script it came from unless it is.
+          #
+          # check-sql-standards.sh ran in ONE repo with THAT repo's own credential: the pin and the
+          # token were 1:1, so "the pin names some repository" was bounded by "whoever can commit
+          # here already has this repo". A reusable org workflow breaks that pairing. One shared
+          # ORCHESTRATOR_PAT now rides along with every calling repo, including the lowest-trust one
+          # in the org, and `GUARD_REPO` feeds `actions/checkout`'s `repository:` directly -- after
+          # which this job EXECUTES what was checked out, as `node .guard/guard/index.mjs`, on a
+          # persistent self-hosted runner.
+          #
+          # Reading the pin from the base rather than the working tree (above) stops a pull request
+          # from choosing its own guard. It does not stop someone who can land a commit on a
+          # consuming repo's DEFAULT BRANCH, because the default branch is the base. A shape check
+          # accepts any well-formed owner/repo from that file. So the shape check is not enough here
+          # even though the identical line was enough there.
+          #
+          # A CONSTANT, deliberately, and not either softer option:
+          #
+          #   - A `workflow_call` input with a default. The CALLER's workflow file sets that, and the
+          #     caller's workflow file sits in the same repo, on the same branch, behind the same
+          #     commit access as the package.json this check exists not to trust. It moves the value
+          #     without moving the trust.
+          #   - An allowlist. Defensible when a second guard exists. Today none does, so it is this
+          #     constant with somewhere convenient to add a second entry later without review.
+          #
+          # This pins WHICH REPOSITORY, never which version. The ref half still comes from the
+          # consumer's package.json and is still required to be a 40-hex commit SHA below -- a
+          # consumer chooses which commit of the trusted guard it enforces, which is the entire
+          # design and must not be narrowed by this check.
+          # Compared CASE-INSENSITIVELY. GitHub owner and repository names are case-insensitive and
+          # resolve to the same repository, so an exact match would reject a correct pin over its
+          # spelling -- and both spellings are in live use: this org's own workflows contain
+          # FieldStackHQ three times and FieldStackhq twice, while the one existing consumer pins
+          # the lowercase form. An exact test would have rejected the majority spelling for naming
+          # the right repository. Folding case costs nothing here, because the two forms are the
+          # same repository to GitHub and therefore the same trust decision.
+          if [ "${GUARD_REPO,,}" != "${EXPECTED_GUARD_REPO,,}" ]; then
+            echo "::error::fieldstack.standardsGuardRef names the repository '$GUARD_REPO' (read from $PIN_SOURCE), but this workflow only runs the guard from '$EXPECTED_GUARD_REPO'. It checks that repository out with a shared org credential and then executes it, so the repository is fixed here rather than taken from the calling repo. Change the ref half to pin a different guard version; the repository half is not configurable."
+            exit 1
+          fi
+
+          # STRICTER than check-sql-standards.sh, deliberately.
+          #
+          # That script's comments state the rule -- "the ref in package.json is an immutable
+          # COMMIT SHA, never a tag" -- and give the reason: a git tag moves for anyone with
+          # push access, and this guard executes as arbitrary Node inside a check that can
+          # block a merge, so a retagged v0.11.0 would silently start running different code
+          # with nothing in the consumer's history to show it. The script documents the rule
+          # and does not enforce it. Here it is enforced, because a comment promising a
+          # property that nothing checks is a property the next bump can drop for free.
+          if ! printf '%s' "$GUARD_SHA" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "::error::The ref half of fieldstack.standardsGuardRef ('$GUARD_SHA') is not a 40-character commit SHA (read from $PIN_SOURCE). Pin a SHA, never a tag or a branch: a tag moves for anyone with push access, and this guard runs as arbitrary code inside a check that can block a merge."
+            exit 1
+          fi
+
+          echo "Guard ref: $GUARD_PKG (read from $PIN_SOURCE)"
+          echo "Diff range: $RANGE"
+          {
+            printf 'guard-repo=%s\n' "$GUARD_REPO"
+            printf 'guard-ref=%s\n' "$GUARD_SHA"
+            printf 'range=%s\n' "$RANGE"
+          } >> "$GITHUB_OUTPUT"
+
+      # The guard is CHECKED OUT and run from disk rather than fetched with `npx --package`.
+      #
+      # Established in fieldstack-service-hub on 2026-08-24: both `npx` and `pnpm` fail on
+      # these runners with `Host key verification failed`, because pnpm/npm record a private
+      # git dependency as an SSH URL whatever specifier form is written and the runner has no
+      # key. The gate had never actually run in CI until it was switched to a checkout.
+      #
+      # It also keeps the stance e2e.yml and promote-prod.yml both state -- never hand an org
+      # secret to a runner that installs arbitrary npm packages. This job installs none: the
+      # guard has no dependencies and no devDependencies, so running it is `node <file>` with
+      # nothing fetched from a registry. The token is used for one git fetch and nothing else.
+      #
+      # persist-credentials: false so the token is not left in .guard/.git/config for the rest
+      # of the job -- including for the guard's own execution.
+      - name: Check out the pinned guard
+        id: guard-checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: ${{ steps.guard-ref.outputs.guard-repo }}
+          ref: ${{ steps.guard-ref.outputs.guard-ref }}
+          token: ${{ secrets.ORCHESTRATOR_PAT }}
+          path: .guard
+          persist-credentials: false
+
+      # Every other hand-rolled failure in this file tells the triager whether it is TOOLING or a
+      # SQL violation -- the entry-missing check, the timeout, the pre-flight probe, the per-batch
+      # reclassification. The checkout above did not, and it is one of the likelier places to fail:
+      # a pinned commit can vanish after a force-push or a rebase in the guard repo, and the token
+      # can lose read access. All the triager saw was actions/checkout's generic error, which reads
+      # like a problem with their SQL.
+      #
+      # SCOPED TO THE CHECKOUT IT NAMES. A blanket `if: failure()` fires on ANY earlier failure, so a
+      # broken pin resolution -- or anything else upstream -- would have printed a confident message
+      # blaming the guard checkout, which is worse than the generic error it replaced: it sends the
+      # triager to a step that was fine. `steps.guard-checkout.conclusion` is the only thing that
+      # says this step is the one that failed.
+      #
+      # `failure() &&` is kept as well as the conclusion test, because a step-level `if` that names
+      # only a condition runs even when the job is already failing; the pair says "the job failed AND
+      # it failed here".
+      - name: Explain a guard-checkout failure
+        if: failure() && steps.guard-checkout.conclusion == 'failure'
+        shell: bash
+        env:
+          GUARD_REPO: ${{ steps.guard-ref.outputs.guard-repo }}
+          GUARD_REF: ${{ steps.guard-ref.outputs.guard-ref }}
+        run: |
+          set -uo pipefail
+          echo "::error::Could not check out the pinned guard ${GUARD_REPO:-<unresolved>}@${GUARD_REF:-<unresolved>}. This is a TOOLING failure, not a SQL rule violation -- nothing in the calling repo's SQL has been examined. The usual causes are a pinned commit that no longer exists in the guard repository (force-push, rebase, or garbage collection) and an ORCHESTRATOR_PAT without read access to it. Fix the pin or the credential; do not read this as a finding against the change under review."
+
+      - name: Check SQL against the writing-sql standards
+        shell: bash
+        env:
+          RANGE: ${{ steps.guard-ref.outputs.range }}
+          GUARD_PKG: 'github:${{ steps.guard-ref.outputs.guard-repo }}#${{ steps.guard-ref.outputs.guard-ref }}'
+          GUARD_TIMEOUT_SECONDS: ${{ inputs.guard-timeout-seconds }}
+        run: |
+          # See the note in the resolve step: errexit is on, from the executor, and stays on.
+          set -uo pipefail
+
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+
+          GUARD_ENTRY="$GITHUB_WORKSPACE/.guard/guard/index.mjs"
+          if [ ! -f "$GUARD_ENTRY" ]; then
+            echo "::error::The guard was checked out but $GUARD_ENTRY is missing. This is a TOOLING failure, not a SQL rule violation -- the pinned commit ($GUARD_PKG) may predate that entry point."
+            exit 1
+          fi
+          GUARD_CMD=(node "$GUARD_ENTRY")
+
+          # Every guard invocation is bounded. Node can stall on a pathological input and the
+          # step would then hold a self-hosted runner slot until the job timeout kills it,
+          # with no diagnosis at all. `timeout` exits 124, which is routed to the TOOLING path
+          # below rather than being reported as a rule violation.
+          # VALIDATED, because GNU `timeout` reads a duration of 0 as "no timeout at all". A caller
+          # setting `guard-timeout-seconds: 0` -- or any non-numeric value -- would silently hand
+          # back the unbounded-runner-slot problem this bound exists to prevent, with nothing
+          # anywhere saying so. A trusted caller can still misconfigure; the failure should be loud.
+          if ! printf '%s' "$GUARD_TIMEOUT_SECONDS" | grep -Eq '^[0-9]+$' || [ "$GUARD_TIMEOUT_SECONDS" -lt 1 ]; then
+            echo "::error::guard-timeout-seconds is '$GUARD_TIMEOUT_SECONDS', which is not a positive whole number of seconds. GNU timeout treats 0 as no timeout at all, so this would leave every guard invocation unbounded on a persistent self-hosted runner."
+            exit 1
+          fi
+
+          if command -v timeout >/dev/null 2>&1; then
+            RUN_GUARD=(timeout "$GUARD_TIMEOUT_SECONDS")
+          else
+            # `env` is a no-op prefix, so the call sites stay identical either way. Said out
+            # loud rather than skipped silently: on a host without coreutils a hang still
+            # hangs. These runners are linux, where timeout is always present.
+            RUN_GUARD=(env)
+            echo "note: 'timeout' is unavailable here, so guard calls are unbounded on this host" >&2
+          fi
+
+          # ONE PLACE THAT INVOKES THE GUARD. There were two -- the probe built
+          # `"${RUN_GUARD[@]}" "${GUARD_CMD[@]}"` and the batch runner built it again from scratch --
+          # so a change to how the guard is called (a new flag, a different bound, a wrapper) had two
+          # sites to reach and no reason to reach both. Two ledgers for one invocation is the shape
+          # this file has now been bitten by twice, in the pin validation and in the argv parsing.
+          #
+          # Output handling stays with the CALLERS, which is the only thing that genuinely differs:
+          # the probe captures to a file it then quotes back, the batch streams to the job log.
+          guard() {
+            "${RUN_GUARD[@]}" "${GUARD_CMD[@]}" "$@"
+          }
+
+          probe_guard() {
+            guard > "$1" 2>&1
+          }
+
+          # --- Which files ------------------------------------------------------------
+          # NUL-delimited throughout. A path containing a space would otherwise be split into
+          # two arguments naming nothing, the guard would fail to read either, and what
+          # surfaced would look like a tool error when what actually happened is that a file
+          # went unchecked -- the worst failure mode available to a gate, because it is
+          # indistinguishable from a pass.
+          #
+          # --diff-filter=d drops deletions: a file that no longer exists cannot violate a rule.
+          #
+          # Split from the grep below so git's OWN exit status is the failure signal. As one
+          # pipeline under pipefail, grep exiting 1 for "no .sql here" makes the pipeline fail,
+          # and deciding whether git failed by asking whether it wrote to stderr does not work
+          # -- git writes to stderr on success too ("inexact rename detection was skipped" on a
+          # large diff), so an ordinary pull request with a harmless warning and no SQL would
+          # go red on a gate that can block a merge, for nothing.
+          git_rc=0
+          git diff -z --name-only --diff-filter=d "$RANGE" > "$tmp/raw" 2>"$tmp/giterr" || git_rc=$?
+          if [ "$git_rc" -ne 0 ]; then
+            echo "::error::git diff failed for range '$RANGE' (exit $git_rc), so no SQL was checked: $(cat "$tmp/giterr")"
+            exit 1
+          fi
+
+          # grep exits 1 on no match, which is the ordinary "this change touched no SQL" case
+          # and is handled by the count check below. Exit 2 or worse is a real failure, and a
+          # blanket `|| true` would put it in the same bucket -- a broken grep would produce an
+          # empty file list, a count of 0, and a green "does not apply", which is exactly the
+          # could-not-tell-what-changed-looking-like-nothing-to-check trap guarded against
+          # three lines above for git.
+          grep_rc=0
+          grep -zE '\.sql$' "$tmp/raw" > "$tmp/sql" || grep_rc=$?
+          if [ "$grep_rc" -gt 1 ]; then
+            echo "::error::Could not filter the changed-file list for .sql (grep exited $grep_rc), so no SQL was checked. This is a hard failure rather than a pass: an unfiltered list is indistinguishable from an empty one."
+            exit 1
+          fi
+
+          # --- Pre-flight: prove the guard resolves, on EVERY run ----------------------
+          # Runs BEFORE the "did anything change" check, not after it. Skipping straight out
+          # when no .sql changed is how a gate stays green for months while never once running
+          # the guard, and the first change that touched SQL would be the first to find out. A
+          # green run here means the guard is RUNNABLE, not merely that nothing asked it a
+          # question.
+          #
+          # The zero-argument call is the resolution probe: it asks "can the guard run at all"
+          # without asking it about any SQL. That contract -- zero files in, exit 0 -- is
+          # pinned by a test in fieldstack-dev-skills ("CLI: zero-file invocation exits 0
+          # (resolution probe contract)"), so this is not relying on an untested assumption
+          # about a CLI it does not own.
+          #
+          # Without it, a failure to run the guard exits non-zero and gets reported as a SQL
+          # rule violation, sending whoever triages a red check to look for a violation that
+          # was never there.
+          probe_rc=0
+          probe_guard "$tmp/preflight" || probe_rc=$?
+          if [ "$probe_rc" -ne 0 ]; then
+            echo "::error::Could not run the standards guard ($GUARD_PKG), exit $probe_rc. This is a TOOLING failure, not a SQL rule violation -- check the checkout above and confirm the pinned commit exists."
+            cat "$tmp/preflight" >&2 || true
+            exit 1
+          fi
+
+          count=$(tr -cd '\0' < "$tmp/sql" | wc -c | tr -d ' ')
+          if [ "$count" -eq 0 ]; then
+            echo "No .sql changed in range '$RANGE' -- SQL standards check does not apply."
+            echo "The guard was probed anyway and resolved, so this is a verified skip rather than an unverified one."
+            exit 0
+          fi
+
+          echo "Checking $count changed .sql file(s) against $GUARD_PKG"
+          tr '\0' '\n' < "$tmp/sql" | sed 's/^/  /'
+          echo
+
+          # --- Run the guard ------------------------------------------------------------
+          # Batched by hand rather than through xargs, because the batch that FAILED is the
+          # only place a failure can honestly be classified. Probing once after the whole run
+          # has finished is a heuristic dressed as a fix: a tooling fault that killed an early
+          # batch can clear up before the probe runs, and the run is then reported as "fix the
+          # violation" for a broken runner. It fails the other way too -- a guard that dies
+          # AFTER a real violation gets that violation reported as TOOLING, and someone retries
+          # CI instead of fixing the SQL.
+          #
+          # Probing immediately after the failing invocation does not make the classification
+          # perfect -- nothing can, short of the guard reporting its own failure mode -- but it
+          # shrinks the window from "the rest of the run" to the milliseconds between the two
+          # calls. Read it as best-effort, not as a guarantee.
+          #
+          # Batches of 40 because a large change can exceed the argument limit, and a guard
+          # that dies on "argument list too long" is a gate that fails open on exactly the
+          # biggest changes.
+          # A PATH THAT COULD BE READ AS AN OPTION IS PASSED AS `./path`.
+          #
+          # `git diff --name-only` emits repo-relative paths, so a repository-root file named
+          # `--evil.sql` arrives as exactly that string. Handed to the guard positionally, an argv
+          # filter that drops option-SHAPED arguments discards it -- and an empty file list is the
+          # guard's resolution-probe contract, so the run exits 0 saying nothing. Not skipped with a
+          # warning: reported as clean. That was live in fieldstack-service-hub and is fixed in the
+          # guard as of 9c249592.
+          #
+          # THIS WORKFLOW STILL CANNOT RELY ON THAT FIX, which is the whole reason this exists. The
+          # guard version is chosen by the CONSUMER, from its own package.json -- this file resolves
+          # whatever it is pointed at, including a ref that predates 9c249592. A gate whose
+          # correctness depends on the version of the thing it is gating is not a gate.
+          #
+          # `--` does NOT solve it here for the same reason: a guard old enough to have the bug is
+          # also old enough to discard the `--` itself. `./` does, against every version, because
+          # `./--evil.sql` does not begin with a dash while naming the same file, and the guard's
+          # globs match it -- their `**/` prefix already spans a leading `./`.
+          prefix_dashed() {
+            case "$1" in
+              -*) printf './%s' "$1" ;;
+              *)  printf '%s' "$1" ;;
+            esac
+          }
+
+          BATCH_SIZE=40
+          tooling_failure=0
+          violation_found=0
+          batch=()
+
+          # AN AGGREGATE BOUND, because the per-batch one does not add up to a job-level guarantee.
+          #
+          # `guard-timeout-seconds` bounds ONE invocation. `timeout-minutes` on the job bounds the
+          # whole run. Neither bounds the SUM: with the defaults, nine batches that each finish just
+          # inside 300s take 45 minutes without any single one breaking its limit, and the job
+          # timeout then kills the runner cold -- no `::error::`, no classification, nothing saying
+          # whether it was the guard or the SQL. That is the exact outcome the per-call timeout was
+          # added to avoid, reappearing one level up.
+          #
+          # So the guard stops itself first, and says why. Deliberately BELOW the job's
+          # `timeout-minutes: 30` -- the two numbers are coupled and the coupling is stated at both
+          # ends, because nothing can enforce it: `timeout-minutes` is YAML the shell cannot read.
+          # If one moves, move the other.
+          GUARD_BUDGET_SECONDS=1200
+          run_started=$SECONDS
+
+          run_batch() {
+            if [ "${#batch[@]}" -eq 0 ]; then
+              return 0
+            fi
+            # Checked BEFORE the call, not after: the point is to fail with a diagnosis while there
+            # is still job time left to print it in.
+            local elapsed=$((SECONDS - run_started))
+            if [ "$elapsed" -ge "$GUARD_BUDGET_SECONDS" ]; then
+              echo
+              echo "::error::The standards guard has been running for ${elapsed}s, past this job's ${GUARD_BUDGET_SECONDS}s aggregate budget, with batches still to check. This is a TOOLING failure, not a SQL rule violation -- no single batch exceeded its own ${GUARD_TIMEOUT_SECONDS}s limit, they simply added up. Stopping here so this reports rather than being killed by the job timeout with no diagnosis. Raise guard-timeout-seconds and timeout-minutes together if this change is genuinely this large."
+              tooling_failure=1
+              return 1
+            fi
+            local rc=0
+            # Captured explicitly rather than read from `$?` after an `if`: bash sets `$?` to
+            # the status of the `if` statement itself, which is 0 even when the condition
+            # failed, so the timeout check below would never see 124.
+            guard "${batch[@]}" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              return 0
+            fi
+            if [ "$rc" -eq 124 ]; then
+              echo
+              echo "::error::The standards guard timed out after ${GUARD_TIMEOUT_SECONDS}s on the batch beginning with '${batch[0]}'. This is a TOOLING failure, not a SQL rule violation."
+              tooling_failure=1
+              return 1
+            fi
+            # Classify HERE, against the invocation that actually failed.
+            if ! probe_guard "$tmp/recheck"; then
+              echo
+              # The two states are independent, and a run can be in both. Reporting only the
+              # tooling half tells the reader "this is not a rule violation" when it also was
+              # one, and they retry CI expecting green instead of fixing SQL that genuinely
+              # breaks a rule.
+              if [ "$violation_found" -ne 0 ]; then
+                echo "::error::The standards guard stopped running part-way through ($GUARD_PKG), on the batch beginning with '${batch[0]}'. A REAL rule violation was already reported earlier in this run (see the guard output above) -- fix that as well; the tooling failure does not excuse it."
+              else
+                echo "::error::The standards guard stopped running part-way through ($GUARD_PKG). This is a TOOLING failure, not a SQL rule violation. It failed on the batch beginning with '${batch[0]}'. Guard output follows."
+              fi
+              cat "$tmp/recheck" >&2 || true
+              tooling_failure=1
+              return 1
+            fi
+            violation_found=1
+            return 0
+          }
+
+          while IFS= read -r -d '' f; do
+            batch+=("$(prefix_dashed "$f")")
+            if [ "${#batch[@]}" -ge "$BATCH_SIZE" ]; then
+              run_batch || break
+              batch=()
+            fi
+          done < "$tmp/sql"
+
+          # The final partial batch, unless the loop already stopped on a tooling failure.
+          if [ "$tooling_failure" -eq 0 ]; then
+            run_batch || true
+          fi
+
+          if [ "$tooling_failure" -ne 0 ]; then
+            exit 1
+          fi
+
+          if [ "$violation_found" -ne 0 ]; then
+            echo
+            echo "::error::SQL standards check failed. Fix the violation, or record an approval marker naming the rule (see the guard output above)."
+            exit 1
+          fi
+
+          echo "SQL standards check passed."
