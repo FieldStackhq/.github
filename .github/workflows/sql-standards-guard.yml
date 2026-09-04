@@ -81,6 +81,20 @@ jobs:
   sql-standards:
     name: sql-standards
     runs-on: [self-hosted, linux, x64]
+    # A BOUND ON THE WHOLE JOB, not only on the guard call.
+    #
+    # `guard-timeout-seconds` exists because a stalled guard holds a self-hosted runner slot with no
+    # diagnosis. That danger is not unique to the guard: the root `actions/checkout` fetches full
+    # history, `setup-node` pulls a toolchain, the cross-repo checkout reaches another repository
+    # over the network, and each `git show` and `node` call in the resolve step is unbounded. Every
+    # one of them can hang, and without this the job would sit on a shared runner for GitHub's
+    # 360-minute default before anyone learned anything.
+    #
+    # It does NOT replace the per-call timeout, and the difference is the point: a job timeout kills
+    # the runner slot and tells you nothing, while `timeout` around the guard exits 124, which this
+    # workflow catches and reports as a TOOLING failure rather than a SQL violation. The inner bound
+    # diagnoses; this one is the backstop for everything it cannot see.
+    timeout-minutes: 30
     steps:
       - name: Clean workspace (self-hosted pre-run maintenance)
         working-directory: ${{ github.workspace }}
@@ -487,8 +501,20 @@ jobs:
             echo "note: 'timeout' is unavailable here, so guard calls are unbounded on this host" >&2
           fi
 
+          # ONE PLACE THAT INVOKES THE GUARD. There were two -- the probe built
+          # `"${RUN_GUARD[@]}" "${GUARD_CMD[@]}"` and the batch runner built it again from scratch --
+          # so a change to how the guard is called (a new flag, a different bound, a wrapper) had two
+          # sites to reach and no reason to reach both. Two ledgers for one invocation is the shape
+          # this file has now been bitten by twice, in the pin validation and in the argv parsing.
+          #
+          # Output handling stays with the CALLERS, which is the only thing that genuinely differs:
+          # the probe captures to a file it then quotes back, the batch streams to the job log.
+          guard() {
+            "${RUN_GUARD[@]}" "${GUARD_CMD[@]}" "$@"
+          }
+
           probe_guard() {
-            "${RUN_GUARD[@]}" "${GUARD_CMD[@]}" > "$1" 2>&1
+            guard > "$1" 2>&1
           }
 
           # --- Which files ------------------------------------------------------------
@@ -616,7 +642,7 @@ jobs:
             # Captured explicitly rather than read from `$?` after an `if`: bash sets `$?` to
             # the status of the `if` statement itself, which is 0 even when the condition
             # failed, so the timeout check below would never see 124.
-            "${RUN_GUARD[@]}" "${GUARD_CMD[@]}" "${batch[@]}" || rc=$?
+            guard "${batch[@]}" || rc=$?
             if [ "$rc" -eq 0 ]; then
               return 0
             fi
