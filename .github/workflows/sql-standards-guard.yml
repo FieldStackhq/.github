@@ -409,6 +409,7 @@ jobs:
       # persist-credentials: false so the token is not left in .guard/.git/config for the rest
       # of the job -- including for the guard's own execution.
       - name: Check out the pinned guard
+        id: guard-checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: ${{ steps.guard-ref.outputs.guard-repo }}
@@ -424,9 +425,17 @@ jobs:
       # can lose read access. All the triager saw was actions/checkout's generic error, which reads
       # like a problem with their SQL.
       #
-      # `if: failure()` rather than a wrapper, so it costs nothing on the runs that work.
+      # SCOPED TO THE CHECKOUT IT NAMES. A blanket `if: failure()` fires on ANY earlier failure, so a
+      # broken pin resolution -- or anything else upstream -- would have printed a confident message
+      # blaming the guard checkout, which is worse than the generic error it replaced: it sends the
+      # triager to a step that was fine. `steps.guard-checkout.conclusion` is the only thing that
+      # says this step is the one that failed.
+      #
+      # `failure() &&` is kept as well as the conclusion test, because a step-level `if` that names
+      # only a condition runs even when the job is already failing; the pair says "the job failed AND
+      # it failed here".
       - name: Explain a guard-checkout failure
-        if: failure()
+        if: failure() && steps.guard-checkout.conclusion == 'failure'
         shell: bash
         env:
           GUARD_REPO: ${{ steps.guard-ref.outputs.guard-repo }}
@@ -569,6 +578,31 @@ jobs:
           # Batches of 40 because a large change can exceed the argument limit, and a guard
           # that dies on "argument list too long" is a gate that fails open on exactly the
           # biggest changes.
+          # A PATH THAT COULD BE READ AS AN OPTION IS PASSED AS `./path`.
+          #
+          # `git diff --name-only` emits repo-relative paths, so a repository-root file named
+          # `--evil.sql` arrives as exactly that string. Handed to the guard positionally, an argv
+          # filter that drops option-SHAPED arguments discards it -- and an empty file list is the
+          # guard's resolution-probe contract, so the run exits 0 saying nothing. Not skipped with a
+          # warning: reported as clean. That was live in fieldstack-service-hub and is fixed in the
+          # guard as of 9c249592.
+          #
+          # THIS WORKFLOW STILL CANNOT RELY ON THAT FIX, which is the whole reason this exists. The
+          # guard version is chosen by the CONSUMER, from its own package.json -- this file resolves
+          # whatever it is pointed at, including a ref that predates 9c249592. A gate whose
+          # correctness depends on the version of the thing it is gating is not a gate.
+          #
+          # `--` does NOT solve it here for the same reason: a guard old enough to have the bug is
+          # also old enough to discard the `--` itself. `./` does, against every version, because
+          # `./--evil.sql` does not begin with a dash while naming the same file, and the guard's
+          # globs match it -- their `**/` prefix already spans a leading `./`.
+          prefix_dashed() {
+            case "$1" in
+              -*) printf './%s' "$1" ;;
+              *)  printf '%s' "$1" ;;
+            esac
+          }
+
           BATCH_SIZE=40
           tooling_failure=0
           violation_found=0
@@ -613,7 +647,7 @@ jobs:
           }
 
           while IFS= read -r -d '' f; do
-            batch+=("$f")
+            batch+=("$(prefix_dashed "$f")")
             if [ "${#batch[@]}" -ge "$BATCH_SIZE" ]; then
               run_batch || break
               batch=()
