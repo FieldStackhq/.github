@@ -1,6 +1,5 @@
 name: SQL Standards Guard (Reusable)
 
-# ==============================================================================
 # The CI half of the FieldStack standards guard, for every repo in the org.
 #
 # This workflow resolves WHICH files to check and WHICH version of the rules to enforce.
@@ -40,7 +39,6 @@ name: SQL Standards Guard (Reusable)
 # guards how SQL is written at all -- transactions, index DDL, protected POS/checkout
 # objects -- and it FAILS the job. Different standards, different failure modes; a caller
 # normally wants both.
-# ==============================================================================
 
 on:
   workflow_call:
@@ -94,6 +92,11 @@ jobs:
     # the runner slot and tells you nothing, while `timeout` around the guard exits 124, which this
     # workflow catches and reports as a TOOLING failure rather than a SQL violation. The inner bound
     # diagnoses; this one is the backstop for everything it cannot see.
+    #
+    # COUPLED to GUARD_BUDGET_SECONDS in the check step, which stops the guard at 1200s so the
+    # pile-up of many in-limit batches reports itself instead of being killed here with no
+    # diagnosis. That coupling cannot be enforced -- this is YAML the shell cannot read -- so it is
+    # stated at both ends. If one moves, move the other.
     timeout-minutes: 30
     steps:
       - name: Clean workspace (self-hosted pre-run maintenance)
@@ -634,9 +637,34 @@ jobs:
           violation_found=0
           batch=()
 
+          # AN AGGREGATE BOUND, because the per-batch one does not add up to a job-level guarantee.
+          #
+          # `guard-timeout-seconds` bounds ONE invocation. `timeout-minutes` on the job bounds the
+          # whole run. Neither bounds the SUM: with the defaults, nine batches that each finish just
+          # inside 300s take 45 minutes without any single one breaking its limit, and the job
+          # timeout then kills the runner cold -- no `::error::`, no classification, nothing saying
+          # whether it was the guard or the SQL. That is the exact outcome the per-call timeout was
+          # added to avoid, reappearing one level up.
+          #
+          # So the guard stops itself first, and says why. Deliberately BELOW the job's
+          # `timeout-minutes: 30` -- the two numbers are coupled and the coupling is stated at both
+          # ends, because nothing can enforce it: `timeout-minutes` is YAML the shell cannot read.
+          # If one moves, move the other.
+          GUARD_BUDGET_SECONDS=1200
+          run_started=$SECONDS
+
           run_batch() {
             if [ "${#batch[@]}" -eq 0 ]; then
               return 0
+            fi
+            # Checked BEFORE the call, not after: the point is to fail with a diagnosis while there
+            # is still job time left to print it in.
+            local elapsed=$((SECONDS - run_started))
+            if [ "$elapsed" -ge "$GUARD_BUDGET_SECONDS" ]; then
+              echo
+              echo "::error::The standards guard has been running for ${elapsed}s, past this job's ${GUARD_BUDGET_SECONDS}s aggregate budget, with batches still to check. This is a TOOLING failure, not a SQL rule violation -- no single batch exceeded its own ${GUARD_TIMEOUT_SECONDS}s limit, they simply added up. Stopping here so this reports rather than being killed by the job timeout with no diagnosis. Raise guard-timeout-seconds and timeout-minutes together if this change is genuinely this large."
+              tooling_failure=1
+              return 1
             fi
             local rc=0
             # Captured explicitly rather than read from `$?` after an `if`: bash sets `$?` to
