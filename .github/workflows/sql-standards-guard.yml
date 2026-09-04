@@ -147,6 +147,9 @@ jobs:
         id: guard-ref
         shell: bash
         env:
+          # The trigger, because the commit graph cannot tell a pull_request merge ref from an
+          # ordinary merge commit on a branch -- see the range resolution below.
+          EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PACKAGE_JSON_PATH: ${{ inputs.package-json-path }}
@@ -173,7 +176,23 @@ jobs:
           # Two computations of the same range are two answers waiting to diverge.
           RANGE=""
           BASE_REF=""
-          if git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1; then
+          # GATED ON THE EVENT, not on the shape of HEAD.
+          #
+          # This branch used to fire whenever `HEAD^2` resolved -- that is, whenever HEAD had two
+          # parents. That is true of GitHub's pull_request merge ref, which is what it was written
+          # for. It is equally true of HEAD after an ordinary PUSH of a merge commit, which is
+          # exactly what `main` looks like in any repo using GitHub's default merge strategy.
+          #
+          # The push path below is reachable -- it is a supported fallback -- so on a push whose HEAD
+          # happened to be a merge commit, this branch won the race and computed HEAD^1...HEAD^2:
+          # the contents of that ONE merge, not what the push contained. A push carrying several
+          # commits would have had the rest silently excluded from the diff, and the gate would have
+          # reported clean on SQL it never looked at. That is the same failure this whole step is
+          # written to avoid, arriving through the branch meant to prevent it.
+          #
+          # `github.event_name` is the only thing that actually distinguishes the two, because the
+          # commit graph cannot: a merge ref and a merged main are the same shape.
+          if [ "${EVENT_NAME:-}" = "pull_request" ] && git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1; then
             # On pull_request, checkout leaves HEAD at the merge commit: HEAD^1 is the base
             # tip and HEAD^2 the pull request head. Three dots gives exactly what changed.
             RANGE='HEAD^1...HEAD^2'
@@ -187,7 +206,7 @@ jobs:
             RANGE="${PUSH_BEFORE}...HEAD"
             BASE_REF="$PUSH_BEFORE"
           else
-            echo "::error::Could not resolve a diff range (no HEAD^2, no pull_request base sha, no usable push 'before'), so no SQL was checked. This is a hard failure rather than a pass. Call this workflow from a pull_request trigger, and check out with fetch-depth: 0."
+            echo "::error::Could not resolve a diff range for event '${EVENT_NAME:-<unset>}' (no pull_request merge ref, no pull_request base sha, no usable push 'before'), so no SQL was checked. This is a hard failure rather than a pass. Call this workflow from a pull_request trigger, and check out with fetch-depth: 0."
             exit 1
           fi
 
@@ -397,6 +416,24 @@ jobs:
           token: ${{ secrets.ORCHESTRATOR_PAT }}
           path: .guard
           persist-credentials: false
+
+      # Every other hand-rolled failure in this file tells the triager whether it is TOOLING or a
+      # SQL violation -- the entry-missing check, the timeout, the pre-flight probe, the per-batch
+      # reclassification. The checkout above did not, and it is one of the likelier places to fail:
+      # a pinned commit can vanish after a force-push or a rebase in the guard repo, and the token
+      # can lose read access. All the triager saw was actions/checkout's generic error, which reads
+      # like a problem with their SQL.
+      #
+      # `if: failure()` rather than a wrapper, so it costs nothing on the runs that work.
+      - name: Explain a guard-checkout failure
+        if: failure()
+        shell: bash
+        env:
+          GUARD_REPO: ${{ steps.guard-ref.outputs.guard-repo }}
+          GUARD_REF: ${{ steps.guard-ref.outputs.guard-ref }}
+        run: |
+          set -uo pipefail
+          echo "::error::Could not check out the pinned guard ${GUARD_REPO:-<unresolved>}@${GUARD_REF:-<unresolved>}. This is a TOOLING failure, not a SQL rule violation -- nothing in the calling repo's SQL has been examined. The usual causes are a pinned commit that no longer exists in the guard repository (force-push, rebase, or garbage collection) and an ORCHESTRATOR_PAT without read access to it. Fix the pin or the credential; do not read this as a finding against the change under review."
 
       - name: Check SQL against the writing-sql standards
         shell: bash
