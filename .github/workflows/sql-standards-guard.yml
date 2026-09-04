@@ -268,20 +268,31 @@ jobs:
           read_pin "$BASE_REF:$PKG_PATH" "$PKG_PATH on the base of this diff ($BASE_REF). This is NOT treated as a bootstrap: falling back to the pull request's own tree on a failed base read would hand the choice of guard back to the diff under review, and the base"
           PIN_SOURCE="$BASE_REF"
 
+          # THERE IS NO BOOTSTRAP FALLBACK, and its removal is the point of this block.
+          #
+          # There was one: if the base carried no pin, the ref was read from HEAD instead, with a
+          # comment asserting the branch "cannot be reached afterwards... because a pull request
+          # cannot rewrite its own base". That reasoning holds only while the base actually carries
+          # the key. It says nothing about a repo where the key never landed, or where a later merge
+          # dropped it -- and in that repo EVERY pull request finds an empty base pin, takes the
+          # fallback, and chooses its own guard commit from its own tree.
+          #
+          # So the branch was not one-time. It was the DEFAULT for any repo missing the key, which is
+          # exactly the population least likely to notice. A "one-time" exception entered whenever a
+          # value is absent is not an exception; it is the behaviour, and a `::warning::` on a run
+          # nobody reads does not change that.
+          #
+          # This is the same class as the repository pin one commit earlier -- a value the calling
+          # repo controls deciding what code this job executes -- and fixing the repository half
+          # while leaving the ref half open is a fix that reached one door and not its twin, in the
+          # same file. Deleting the branch closes the class rather than adding a third check to it.
+          #
+          # The cost is real and is the right trade: adopting this gate is TWO steps, not one. Land
+          # `fieldstack.standardsGuardRef` on the default branch first, then add the `uses:` line.
+          # The failure message below says so, because the alternative is an onboarding error that
+          # reads like a bug in the gate.
           if [ -z "$GUARD_PKG" ]; then
-            # Bootstrap only, and only after a CLEAN base read: the base carries no pin yet,
-            # which is true exactly once per repo -- in the pull request that adopts this
-            # gate. It cannot be reached afterwards, and it cannot be reached by editing a
-            # pull request, because a pull request cannot rewrite its own base. Announced
-            # loudly rather than tolerated silently, because while this branch is taken the
-            # ref really does come from the diff under review.
-            read_pin "HEAD:$PKG_PATH" "$PKG_PATH at HEAD, after the base ($BASE_REF) was found to carry no fieldstack-dev-skills pin. That file"
-            PIN_SOURCE="HEAD -- BOOTSTRAP, the base carries no pin yet"
-            echo "::warning::No fieldstack.standardsGuardRef on the base ($BASE_REF); bootstrapping from HEAD. This is expected only in the pull request that adopts this gate."
-          fi
-
-          if [ -z "$GUARD_PKG" ]; then
-            fail_pin "Could not read the pinned fieldstack-dev-skills ref from $PKG_PATH (fieldstack.standardsGuardRef) (tried $PIN_SOURCE)."
+            fail_pin "No fieldstack.standardsGuardRef in $PKG_PATH on the base of this diff ($BASE_REF). The ref is read from the BASE and never from the pull request's own tree, so it must already be on the default branch before this workflow can run. Adopting this gate is two steps: first merge a change adding the fieldstack.standardsGuardRef key, then add the uses: line that calls this workflow."
           fi
 
           # --- Split and validate ------------------------------------------------------
@@ -411,6 +422,15 @@ jobs:
           # step would then hold a self-hosted runner slot until the job timeout kills it,
           # with no diagnosis at all. `timeout` exits 124, which is routed to the TOOLING path
           # below rather than being reported as a rule violation.
+          # VALIDATED, because GNU `timeout` reads a duration of 0 as "no timeout at all". A caller
+          # setting `guard-timeout-seconds: 0` -- or any non-numeric value -- would silently hand
+          # back the unbounded-runner-slot problem this bound exists to prevent, with nothing
+          # anywhere saying so. A trusted caller can still misconfigure; the failure should be loud.
+          if ! printf '%s' "$GUARD_TIMEOUT_SECONDS" | grep -Eq '^[0-9]+$' || [ "$GUARD_TIMEOUT_SECONDS" -lt 1 ]; then
+            echo "::error::guard-timeout-seconds is '$GUARD_TIMEOUT_SECONDS', which is not a positive whole number of seconds. GNU timeout treats 0 as no timeout at all, so this would leave every guard invocation unbounded on a persistent self-hosted runner."
+            exit 1
+          fi
+
           if command -v timeout >/dev/null 2>&1; then
             RUN_GUARD=(timeout "$GUARD_TIMEOUT_SECONDS")
           else
