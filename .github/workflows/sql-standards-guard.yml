@@ -322,33 +322,29 @@ jobs:
           # the entire point of it being dedicated.
           DEDICATED_PIN_PATH='.fieldstack/guard.json'
 
-          # Does this path exist at this ref? `git cat-file -e` answers exactly that and nothing
-          # else. It is asked BEFORE `read_pin`, because read_pin treats an unreadable file as a hard
-          # failure -- correct when there is one place to look, and wrong the moment there are two,
-          # where "not here" has to be an ordinary answer rather than an error.
+          # Is this path present at this ref? The question is asked BEFORE `read_pin`, because
+          # read_pin treats an unreadable file as a hard failure -- correct when there is one place
+          # to look, and wrong the moment there are two, where "not here" has to be an ordinary
+          # answer rather than an error.
           #
           # The distinction is the whole reason this is not a loop over two paths with `|| true`:
           # ABSENT must be soft, and PRESENT-BUT-BROKEN must stay hard. Collapsing them would let a
           # corrupt `.fieldstack/guard.json` fall through to package.json and run a different guard
-          # than the file that was actually edited.
-          # THE REF IS PROVEN TO RESOLVE ONCE, BEFORE ANY PATH IS PROBED.
+          # than the file that was actually edited. `try_pin` below holds that line, and the
+          # measurement behind its choice of git command is documented there.
           #
-          # `git cat-file -e "$ref:$path"` exits non-zero for two unrelated reasons: the path is not
-          # in that tree, or the REF itself does not resolve -- a bad SHA, or a shallow clone deep
-          # enough that `HEAD^1` is not there. Treating both as "not here" means a broken ref walks
-          # through both candidate locations and arrives at "no pin in either", which sends whoever
-          # reads it to add a pin that already exists. The git diagnostic that would have said so is
-          # discarded by the `2>/dev/null` that the path probe legitimately needs.
-          #
-          # Asking about the ref separately makes each probe's failure mean exactly one thing.
-          # NO `-q`, deliberately, and this is the second time this line has been wrong.
-          #
-          # `-q` on `--verify` suppresses git's OWN error output -- measured: with it, a bad ref
-          # gives exit 1 and ZERO bytes on stderr; without it, exit 128 and
-          # "fatal: Needed a single revision". So the `git said:` clause below, added in the previous
-          # round precisely to stop this check throwing away its diagnostic, came out empty in the
-          # one case it exists for. A fix that defeats itself, shipped because the test asserted the
-          # message was non-empty rather than that git's words were in it.
+          # THE REF IS PROVEN TO RESOLVE ONCE, BEFORE ANY PATH IS PROBED. A probe of `$ref:$path`
+          # cannot by itself tell "the path is not in that tree" from "the REF does not resolve" --
+          # a bad SHA, or a clone too shallow to contain `HEAD^1`. Treating both as "not here" means
+          # a broken ref walks through both candidate locations and arrives at "no pin in either",
+          # which sends whoever reads it to add a pin that already exists. Resolving the ref once,
+          # up front, leaves each per-path probe with exactly one thing its failure can mean.
+          # NO `-q` on this `--verify`, deliberately: `-q` suppresses git's OWN error output.
+          # Measured -- with `-q`, a bad ref exits 1 and writes ZERO bytes to stderr; without it,
+          # exit 128 and "fatal: Needed a single revision". The `git said:` clause in the message
+          # below exists to carry exactly that text, so `-q` would leave it reporting an empty
+          # diagnostic in the one case it is there for. The `if !` already handles the failure, so
+          # quiet mode buys nothing here and costs the only detail that distinguishes the causes.
           #
           # This failure does NOT route through `fail_pin`, and that is deliberate rather than an
           # oversight: `fail_pin` prints `$tmp/err`, which collects errors from READING AND PARSING a
@@ -366,13 +362,32 @@ jobs:
           # GUARD_PKG is assigned once, below, to whichever candidate wins, which is the only point
           # at which the name is true.
           try_pin() {
-            local ref="$1" path="$2" what="$3"
+            local ref="$1" path="$2" what="$3" listing=""
             GUARD_PKG=""
             PIN_VALUE=""
-            # Now unambiguous: the ref is known good, so a failure here is the path being absent.
-            if ! git cat-file -e "$ref:$path" 2>/dev/null; then
+            # `git ls-tree`, NOT `git cat-file -e`, and the difference is a silently wrong answer.
+            #
+            # `cat-file -e "$ref:$path"` asks whether the OBJECT is readable, which is not the
+            # question being asked here. Measured: with the path present in the tree but its blob
+            # absent from the object store -- a partial or blob-filtered clone whose promisor cannot
+            # be reached -- it exits 1 with ZERO bytes of stderr, which to a bare `if !` is
+            # indistinguishable from a genuinely absent path (that one exits 128, with "does not
+            # exist"). The pin would be read as absent, the gate would fall through to package.json,
+            # and it would run a guard version the edited file never chose -- silently, which is the
+            # one failure this whole step is written to refuse.
+            #
+            # ls-tree asks about the TREE, needs no blob, and separates the cases by construction:
+            # exit 0 with a line is present, exit 0 with no output is absent, and non-zero is not an
+            # answer at all and must not be read as one.
+            if ! listing=$(git ls-tree "$ref" -- "$path" 2>"$tmp/lserr"); then
+              echo "::error::Could not list '$path' at $ref, so whether a pin exists there is unknown and no SQL was checked. This is NOT 'the repo has no pin'. git said: $(tr '\n' ' ' < "$tmp/lserr")"
+              exit 1
+            fi
+            if [ -z "$listing" ]; then
               return 1
             fi
+            # Present in the tree. From here an unreadable blob is a HARD failure through read_pin,
+            # which is what the ABSENT-soft / PRESENT-BUT-BROKEN-hard rule above requires.
             read_pin "$ref:$path" "$what"
             PIN_VALUE="$GUARD_PKG"
             return 0
