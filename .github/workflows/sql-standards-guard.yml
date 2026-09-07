@@ -45,8 +45,10 @@ on:
     inputs:
       package-json-path:
         description: >-
-          Path, relative to the repository root, of the package.json carrying
-          fieldstack.standardsGuardRef.
+          Path, relative to the repository root, of the package.json that may carry
+          fieldstack.standardsGuardRef. Only one of the two pin locations, and the
+          optional one: a repo with no npm surface uses .fieldstack/guard.json instead,
+          which is a fixed path and not configurable.
         required: false
         type: string
         default: 'package.json'
@@ -300,9 +302,143 @@ jobs:
             fi
           }
 
-          GUARD_PKG=""
-          read_pin "$BASE_REF:$PKG_PATH" "$PKG_PATH on the base of this diff ($BASE_REF). This is NOT treated as a bootstrap: falling back to the pull request's own tree on a failed base read would hand the choice of guard back to the diff under review, and the base"
-          PIN_SOURCE="$BASE_REF"
+          # TWO PLACES A PIN MAY LIVE, because most of the SQL in this org cannot hold the first.
+          #
+          # The largest SQL estates in the org are in C# and Rust repos with no npm surface at all,
+          # and they use the same `db/migrations`, `db/programmable` layout as the repo this was
+          # ported from. Requiring a `package.json` would have excluded the majority of what this
+          # gate exists to protect, or forced an npm artifact into repos where someone eventually
+          # tidies it away and silently un-pins the gate.
+          #
+          # The per-repo counts behind that are deliberately NOT restated here. They were true on the
+          # day they were measured and will drift without anything noticing, and a stale number in a
+          # comment is worse than none -- it reads as current. They live, dated and with their
+          # method, in `fieldstack-service-hub` `docs/plans/2026-09-04-standards-enforcement-
+          # completion-plan.md` under D-P3a.
+          #
+          # `.fieldstack/guard.json` is a FIXED path, deliberately not configurable. The
+          # `package-json-path` input exists because a package.json's location is genuinely a
+          # property of the repo; the dedicated file has no such excuse, and one blessed location is
+          # the entire point of it being dedicated.
+          DEDICATED_PIN_PATH='.fieldstack/guard.json'
+
+          # Is this path present at this ref? The question is asked BEFORE `read_pin`, because
+          # read_pin treats an unreadable file as a hard failure -- correct when there is one place
+          # to look, and wrong the moment there are two, where "not here" has to be an ordinary
+          # answer rather than an error.
+          #
+          # The distinction is the whole reason this is not a loop over two paths with `|| true`:
+          # ABSENT must be soft, and PRESENT-BUT-BROKEN must stay hard. Collapsing them would let a
+          # corrupt `.fieldstack/guard.json` fall through to package.json and run a different guard
+          # than the file that was actually edited. `try_pin` below holds that line, and the
+          # measurement behind its choice of git command is documented there.
+          #
+          # THE REF IS PROVEN TO RESOLVE ONCE, BEFORE ANY PATH IS PROBED. A probe of `$ref:$path`
+          # cannot by itself tell "the path is not in that tree" from "the REF does not resolve" --
+          # a bad SHA, or a clone too shallow to contain `HEAD^1`. Treating both as "not here" means
+          # a broken ref walks through both candidate locations and arrives at "no pin in either",
+          # which sends whoever reads it to add a pin that already exists. Resolving the ref once,
+          # up front, leaves each per-path probe with exactly one thing its failure can mean.
+          # NO `-q` on this `--verify`, deliberately: `-q` suppresses git's OWN error output.
+          # Measured -- with `-q`, a bad ref exits 1 and writes ZERO bytes to stderr; without it,
+          # exit 128 and "fatal: Needed a single revision". The `git said:` clause in the message
+          # below exists to carry exactly that text, so `-q` would leave it reporting an empty
+          # diagnostic in the one case it is there for. The `if !` already handles the failure, so
+          # quiet mode buys nothing here and costs the only detail that distinguishes the causes.
+          #
+          # This failure does NOT route through `fail_pin`, and that is deliberate rather than an
+          # oversight: `fail_pin` prints `$tmp/err`, which collects errors from READING AND PARSING a
+          # pin file. Nothing has been read yet here. The diagnostic that matters is git's, in
+          # `$tmp/referr`, so the message carries that instead. Same reasoning for the
+          # two-pins-disagree failure below, where the diagnostic is the two values themselves.
+          if ! git rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>"$tmp/referr"; then
+            echo "::error::The base of this diff ($BASE_REF) does not resolve to a commit, so no pin could be read and no SQL was checked. This is NOT 'the repo has no pin' -- it is a bad ref, or a clone too shallow to contain it. Check out with fetch-depth: 0. git said: $(tr '\n' ' ' < "$tmp/referr")"
+            exit 1
+          fi
+
+          # Sets PIN_VALUE, not GUARD_PKG. `read_pin` still writes GUARD_PKG -- it is shared with the
+          # older single-location path and its name is accurate there -- so this copies the result
+          # out under a name that says what it is: one candidate's value, not yet the chosen pin.
+          # GUARD_PKG is assigned once, below, to whichever candidate wins, which is the only point
+          # at which the name is true.
+          try_pin() {
+            local ref="$1" path="$2" what="$3" listing=""
+            GUARD_PKG=""
+            PIN_VALUE=""
+            # `git ls-tree`, NOT `git cat-file -e`, and the difference is a silently wrong answer.
+            #
+            # `cat-file -e "$ref:$path"` asks whether the OBJECT is readable, which is not the
+            # question being asked here. Measured: with the path present in the tree but its blob
+            # absent from the object store -- a partial or blob-filtered clone whose promisor cannot
+            # be reached -- it exits 1 with ZERO bytes of stderr, which to a bare `if !` is
+            # indistinguishable from a genuinely absent path (that one exits 128, with "does not
+            # exist"). The pin would be read as absent, the gate would fall through to package.json,
+            # and it would run a guard version the edited file never chose -- silently, which is the
+            # one failure this whole step is written to refuse.
+            #
+            # ls-tree asks about the TREE, needs no blob, and separates the cases by construction:
+            # exit 0 with a line is present, exit 0 with no output is absent, and non-zero is not an
+            # answer at all and must not be read as one.
+            if ! listing=$(git ls-tree "$ref" -- "$path" 2>"$tmp/lserr"); then
+              echo "::error::Could not list '$path' at $ref, so whether a pin exists there is unknown and no SQL was checked. This is NOT 'the repo has no pin'. git said: $(tr '\n' ' ' < "$tmp/lserr")"
+              exit 1
+            fi
+            if [ -z "$listing" ]; then
+              return 1
+            fi
+            # Present in the tree. From here an unreadable blob is a HARD failure through read_pin,
+            # which is what the ABSENT-soft / PRESENT-BUT-BROKEN-hard rule above requires.
+            read_pin "$ref:$path" "$what"
+            PIN_VALUE="$GUARD_PKG"
+            return 0
+          }
+
+          BASE_NOTE="on the base of this diff ($BASE_REF). This is NOT treated as a bootstrap: falling back to the pull request's own tree on a failed base read would hand the choice of guard back to the diff under review, and the base"
+
+          DEDICATED_VALUE=""
+          PKG_VALUE=""
+          if try_pin "$BASE_REF" "$DEDICATED_PIN_PATH" "$DEDICATED_PIN_PATH $BASE_NOTE"; then
+            DEDICATED_VALUE="$PIN_VALUE"
+          fi
+          if try_pin "$BASE_REF" "$PKG_PATH" "$PKG_PATH $BASE_NOTE"; then
+            PKG_VALUE="$PIN_VALUE"
+          fi
+
+          # TWO PINS THAT DISAGREE IS A HARD FAILURE. Not a warning, and not a silent precedence
+          # win: two files naming different commits means the gate runs a version of the guard that
+          # only one of them chose, and whoever edited the other has no way to know. Everything else
+          # in this step refuses that shape -- an unresolvable range, a corrupt registry, a
+          # non-conforming ref -- and this is the same shape.
+          #
+          # Agreeing duplicates are deliberately fine, and that is what makes migration possible:
+          # add the new file carrying the same value, land it, then remove the old one. A repo can
+          # cross without a window where the gate cannot run.
+          # NEITHER VALUE HAS BEEN VALIDATED YET at this point -- the `github:owner/repo#<sha>` shape
+          # test and the 40-hex check both run further down, and they cannot run before this because
+          # this decides WHICH value they will run against. So both are repo content, chosen by
+          # whoever can commit to the calling repo, and putting them raw into a workflow command
+          # lets that content write workflow commands: a `::` sequence or a newline in the value
+          # closes the `::error::` and starts something of its own, in a log a reviewer trusts.
+          #
+          # Same reasoning the guard's own sweep applies to corpus filenames before they reach a
+          # step summary. Newlines folded, `::` defanged, and length capped so a very long value
+          # cannot bury the rest of the message.
+          log_safe() {
+            printf '%s' "$1" | tr -d '\r\n' | sed 's/::/;;/g' | cut -c1-120
+          }
+
+          if [ -n "$DEDICATED_VALUE" ] && [ -n "$PKG_VALUE" ] && [ "$DEDICATED_VALUE" != "$PKG_VALUE" ]; then
+            echo "::error::Two pins disagree at $BASE_REF. $DEDICATED_PIN_PATH says '$(log_safe "$DEDICATED_VALUE")' and $PKG_PATH says '$(log_safe "$PKG_VALUE")'. This gate checks out and executes whichever it picks, so it refuses to pick rather than run a guard version only one of these files chose. Make them agree, or delete the one that is no longer authoritative -- $DEDICATED_PIN_PATH is the one that wins when they agree."
+            exit 1
+          fi
+
+          if [ -n "$DEDICATED_VALUE" ]; then
+            GUARD_PKG="$DEDICATED_VALUE"
+            PIN_SOURCE="$BASE_REF:$DEDICATED_PIN_PATH"
+          else
+            GUARD_PKG="$PKG_VALUE"
+            PIN_SOURCE="$BASE_REF:$PKG_PATH"
+          fi
 
           # THERE IS NO BOOTSTRAP FALLBACK, and its removal is the point of this block.
           #
@@ -328,7 +464,7 @@ jobs:
           # The failure message below says so, because the alternative is an onboarding error that
           # reads like a bug in the gate.
           if [ -z "$GUARD_PKG" ]; then
-            fail_pin "No fieldstack.standardsGuardRef in $PKG_PATH on the base of this diff ($BASE_REF). The ref is read from the BASE and never from the pull request's own tree, so it must already be on the default branch before this workflow can run. Adopting this gate is two steps: first merge a change adding the fieldstack.standardsGuardRef key, then add the uses: line that calls this workflow."
+            fail_pin "No fieldstack.standardsGuardRef at $BASE_REF, in either $DEDICATED_PIN_PATH or $PKG_PATH. The ref is read from the BASE and never from the pull request's own tree, so it must already be on the default branch before this workflow can run. Adopting this gate is two steps: first merge a change adding the pin, then add the uses: line that calls this workflow. A repo with no npm surface should use $DEDICATED_PIN_PATH -- {\"fieldstack\":{\"standardsGuardRef\":\"github:owner/repo#<40-char sha>\"}} -- rather than introducing a package.json to hold one key."
           fi
 
           # --- Split and validate ------------------------------------------------------
