@@ -45,8 +45,10 @@ on:
     inputs:
       package-json-path:
         description: >-
-          Path, relative to the repository root, of the package.json carrying
-          fieldstack.standardsGuardRef.
+          Path, relative to the repository root, of the package.json that may carry
+          fieldstack.standardsGuardRef. Only one of the two pin locations, and the
+          optional one: a repo with no npm surface uses .fieldstack/guard.json instead,
+          which is a fixed path and not configurable.
         required: false
         type: string
         default: 'package.json'
@@ -300,9 +302,74 @@ jobs:
             fi
           }
 
-          GUARD_PKG=""
-          read_pin "$BASE_REF:$PKG_PATH" "$PKG_PATH on the base of this diff ($BASE_REF). This is NOT treated as a bootstrap: falling back to the pull request's own tree on a failed base read would hand the choice of guard back to the diff under review, and the base"
-          PIN_SOURCE="$BASE_REF"
+          # TWO PLACES A PIN MAY LIVE, because most of the SQL in this org cannot hold the first.
+          #
+          # Measured 2026-09-07: fieldstack-identity has 84 tracked `.sql` files and no
+          # `package.json`; foundation-wms has 30 and none anywhere; vireots has 6 and none. Roughly
+          # 122 unprotected `.sql` files sit in repos with no npm surface at all, against 69 in the
+          # one large consumer that has a `package.json` -- and wms and vireots use the same
+          # `db/migrations`, `db/programmable` layout as the repo this was ported from. Requiring a
+          # `package.json` would have excluded the majority of what this gate exists to protect, or
+          # forced an npm artifact into C# and Rust repos where someone eventually tidies it away and
+          # silently un-pins the gate.
+          #
+          # `.fieldstack/guard.json` is a FIXED path, deliberately not configurable. The
+          # `package-json-path` input exists because a package.json's location is genuinely a
+          # property of the repo; the dedicated file has no such excuse, and one blessed location is
+          # the entire point of it being dedicated.
+          DEDICATED_PIN_PATH='.fieldstack/guard.json'
+
+          # Does this path exist at this ref? `git cat-file -e` answers exactly that and nothing
+          # else. It is asked BEFORE `read_pin`, because read_pin treats an unreadable file as a hard
+          # failure -- correct when there is one place to look, and wrong the moment there are two,
+          # where "not here" has to be an ordinary answer rather than an error.
+          #
+          # The distinction is the whole reason this is not a loop over two paths with `|| true`:
+          # ABSENT must be soft, and PRESENT-BUT-BROKEN must stay hard. Collapsing them would let a
+          # corrupt `.fieldstack/guard.json` fall through to package.json and run a different guard
+          # than the file that was actually edited.
+          try_pin() {
+            local ref="$1" path="$2" what="$3"
+            GUARD_PKG=""
+            if ! git cat-file -e "$ref:$path" 2>/dev/null; then
+              return 1
+            fi
+            read_pin "$ref:$path" "$what"
+            return 0
+          }
+
+          BASE_NOTE="on the base of this diff ($BASE_REF). This is NOT treated as a bootstrap: falling back to the pull request's own tree on a failed base read would hand the choice of guard back to the diff under review, and the base"
+
+          DEDICATED_VALUE=""
+          PKG_VALUE=""
+          if try_pin "$BASE_REF" "$DEDICATED_PIN_PATH" "$DEDICATED_PIN_PATH $BASE_NOTE"; then
+            DEDICATED_VALUE="$GUARD_PKG"
+          fi
+          if try_pin "$BASE_REF" "$PKG_PATH" "$PKG_PATH $BASE_NOTE"; then
+            PKG_VALUE="$GUARD_PKG"
+          fi
+
+          # TWO PINS THAT DISAGREE IS A HARD FAILURE. Not a warning, and not a silent precedence
+          # win: two files naming different commits means the gate runs a version of the guard that
+          # only one of them chose, and whoever edited the other has no way to know. Everything else
+          # in this step refuses that shape -- an unresolvable range, a corrupt registry, a
+          # non-conforming ref -- and this is the same shape.
+          #
+          # Agreeing duplicates are deliberately fine, and that is what makes migration possible:
+          # add the new file carrying the same value, land it, then remove the old one. A repo can
+          # cross without a window where the gate cannot run.
+          if [ -n "$DEDICATED_VALUE" ] && [ -n "$PKG_VALUE" ] && [ "$DEDICATED_VALUE" != "$PKG_VALUE" ]; then
+            echo "::error::Two pins disagree at $BASE_REF. $DEDICATED_PIN_PATH says '$DEDICATED_VALUE' and $PKG_PATH says '$PKG_VALUE'. This gate checks out and executes whichever it picks, so it refuses to pick rather than run a guard version only one of these files chose. Make them agree, or delete the one that is no longer authoritative -- $DEDICATED_PIN_PATH is the one that wins when they agree."
+            exit 1
+          fi
+
+          if [ -n "$DEDICATED_VALUE" ]; then
+            GUARD_PKG="$DEDICATED_VALUE"
+            PIN_SOURCE="$BASE_REF:$DEDICATED_PIN_PATH"
+          else
+            GUARD_PKG="$PKG_VALUE"
+            PIN_SOURCE="$BASE_REF:$PKG_PATH"
+          fi
 
           # THERE IS NO BOOTSTRAP FALLBACK, and its removal is the point of this block.
           #
@@ -328,7 +395,7 @@ jobs:
           # The failure message below says so, because the alternative is an onboarding error that
           # reads like a bug in the gate.
           if [ -z "$GUARD_PKG" ]; then
-            fail_pin "No fieldstack.standardsGuardRef in $PKG_PATH on the base of this diff ($BASE_REF). The ref is read from the BASE and never from the pull request's own tree, so it must already be on the default branch before this workflow can run. Adopting this gate is two steps: first merge a change adding the fieldstack.standardsGuardRef key, then add the uses: line that calls this workflow."
+            fail_pin "No fieldstack.standardsGuardRef at $BASE_REF, in either $DEDICATED_PIN_PATH or $PKG_PATH. The ref is read from the BASE and never from the pull request's own tree, so it must already be on the default branch before this workflow can run. Adopting this gate is two steps: first merge a change adding the pin, then add the uses: line that calls this workflow. A repo with no npm surface should use $DEDICATED_PIN_PATH -- {\"fieldstack\":{\"standardsGuardRef\":\"github:owner/repo#<40-char sha>\"}} -- rather than introducing a package.json to hold one key."
           fi
 
           # --- Split and validate ------------------------------------------------------
