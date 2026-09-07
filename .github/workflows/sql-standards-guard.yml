@@ -304,14 +304,17 @@ jobs:
 
           # TWO PLACES A PIN MAY LIVE, because most of the SQL in this org cannot hold the first.
           #
-          # Measured 2026-09-07: fieldstack-identity has 84 tracked `.sql` files and no
-          # `package.json`; foundation-wms has 30 and none anywhere; vireots has 6 and none. Roughly
-          # 122 unprotected `.sql` files sit in repos with no npm surface at all, against 69 in the
-          # one large consumer that has a `package.json` -- and wms and vireots use the same
-          # `db/migrations`, `db/programmable` layout as the repo this was ported from. Requiring a
-          # `package.json` would have excluded the majority of what this gate exists to protect, or
-          # forced an npm artifact into C# and Rust repos where someone eventually tidies it away and
-          # silently un-pins the gate.
+          # The largest SQL estates in the org are in C# and Rust repos with no npm surface at all,
+          # and they use the same `db/migrations`, `db/programmable` layout as the repo this was
+          # ported from. Requiring a `package.json` would have excluded the majority of what this
+          # gate exists to protect, or forced an npm artifact into repos where someone eventually
+          # tidies it away and silently un-pins the gate.
+          #
+          # The per-repo counts behind that are deliberately NOT restated here. They were true on the
+          # day they were measured and will drift without anything noticing, and a stale number in a
+          # comment is worse than none -- it reads as current. They live, dated and with their
+          # method, in `fieldstack-service-hub` `docs/plans/2026-09-04-standards-enforcement-
+          # completion-plan.md` under D-P3a.
           #
           # `.fieldstack/guard.json` is a FIXED path, deliberately not configurable. The
           # `package-json-path` input exists because a package.json's location is genuinely a
@@ -328,9 +331,25 @@ jobs:
           # ABSENT must be soft, and PRESENT-BUT-BROKEN must stay hard. Collapsing them would let a
           # corrupt `.fieldstack/guard.json` fall through to package.json and run a different guard
           # than the file that was actually edited.
+          # THE REF IS PROVEN TO RESOLVE ONCE, BEFORE ANY PATH IS PROBED.
+          #
+          # `git cat-file -e "$ref:$path"` exits non-zero for two unrelated reasons: the path is not
+          # in that tree, or the REF itself does not resolve -- a bad SHA, or a shallow clone deep
+          # enough that `HEAD^1` is not there. Treating both as "not here" means a broken ref walks
+          # through both candidate locations and arrives at "no pin in either", which sends whoever
+          # reads it to add a pin that already exists. The git diagnostic that would have said so is
+          # discarded by the `2>/dev/null` that the path probe legitimately needs.
+          #
+          # Asking about the ref separately makes each probe's failure mean exactly one thing.
+          if ! git rev-parse -q --verify "${BASE_REF}^{commit}" >/dev/null 2>"$tmp/referr"; then
+            echo "::error::The base of this diff ($BASE_REF) does not resolve to a commit, so no pin could be read and no SQL was checked. This is NOT 'the repo has no pin' -- it is a bad ref or a clone too shallow to contain it. Check out with fetch-depth: 0. git said: $(tr '\n' ' ' < "$tmp/referr")"
+            exit 1
+          fi
+
           try_pin() {
             local ref="$1" path="$2" what="$3"
             GUARD_PKG=""
+            # Now unambiguous: the ref is known good, so a failure here is the path being absent.
             if ! git cat-file -e "$ref:$path" 2>/dev/null; then
               return 1
             fi
@@ -358,8 +377,22 @@ jobs:
           # Agreeing duplicates are deliberately fine, and that is what makes migration possible:
           # add the new file carrying the same value, land it, then remove the old one. A repo can
           # cross without a window where the gate cannot run.
+          # NEITHER VALUE HAS BEEN VALIDATED YET at this point -- the `github:owner/repo#<sha>` shape
+          # test and the 40-hex check both run further down, and they cannot run before this because
+          # this decides WHICH value they will run against. So both are repo content, chosen by
+          # whoever can commit to the calling repo, and putting them raw into a workflow command
+          # lets that content write workflow commands: a `::` sequence or a newline in the value
+          # closes the `::error::` and starts something of its own, in a log a reviewer trusts.
+          #
+          # Same reasoning the guard's own sweep applies to corpus filenames before they reach a
+          # step summary. Newlines folded, `::` defanged, and length capped so a very long value
+          # cannot bury the rest of the message.
+          log_safe() {
+            printf '%s' "$1" | tr -d '\r\n' | sed 's/::/;;/g' | cut -c1-120
+          }
+
           if [ -n "$DEDICATED_VALUE" ] && [ -n "$PKG_VALUE" ] && [ "$DEDICATED_VALUE" != "$PKG_VALUE" ]; then
-            echo "::error::Two pins disagree at $BASE_REF. $DEDICATED_PIN_PATH says '$DEDICATED_VALUE' and $PKG_PATH says '$PKG_VALUE'. This gate checks out and executes whichever it picks, so it refuses to pick rather than run a guard version only one of these files chose. Make them agree, or delete the one that is no longer authoritative -- $DEDICATED_PIN_PATH is the one that wins when they agree."
+            echo "::error::Two pins disagree at $BASE_REF. $DEDICATED_PIN_PATH says '$(log_safe "$DEDICATED_VALUE")' and $PKG_PATH says '$(log_safe "$PKG_VALUE")'. This gate checks out and executes whichever it picks, so it refuses to pick rather than run a guard version only one of these files chose. Make them agree, or delete the one that is no longer authoritative -- $DEDICATED_PIN_PATH is the one that wins when they agree."
             exit 1
           fi
 
