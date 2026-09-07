@@ -341,19 +341,40 @@ jobs:
           # discarded by the `2>/dev/null` that the path probe legitimately needs.
           #
           # Asking about the ref separately makes each probe's failure mean exactly one thing.
-          if ! git rev-parse -q --verify "${BASE_REF}^{commit}" >/dev/null 2>"$tmp/referr"; then
-            echo "::error::The base of this diff ($BASE_REF) does not resolve to a commit, so no pin could be read and no SQL was checked. This is NOT 'the repo has no pin' -- it is a bad ref or a clone too shallow to contain it. Check out with fetch-depth: 0. git said: $(tr '\n' ' ' < "$tmp/referr")"
+          # NO `-q`, deliberately, and this is the second time this line has been wrong.
+          #
+          # `-q` on `--verify` suppresses git's OWN error output -- measured: with it, a bad ref
+          # gives exit 1 and ZERO bytes on stderr; without it, exit 128 and
+          # "fatal: Needed a single revision". So the `git said:` clause below, added in the previous
+          # round precisely to stop this check throwing away its diagnostic, came out empty in the
+          # one case it exists for. A fix that defeats itself, shipped because the test asserted the
+          # message was non-empty rather than that git's words were in it.
+          #
+          # This failure does NOT route through `fail_pin`, and that is deliberate rather than an
+          # oversight: `fail_pin` prints `$tmp/err`, which collects errors from READING AND PARSING a
+          # pin file. Nothing has been read yet here. The diagnostic that matters is git's, in
+          # `$tmp/referr`, so the message carries that instead. Same reasoning for the
+          # two-pins-disagree failure below, where the diagnostic is the two values themselves.
+          if ! git rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>"$tmp/referr"; then
+            echo "::error::The base of this diff ($BASE_REF) does not resolve to a commit, so no pin could be read and no SQL was checked. This is NOT 'the repo has no pin' -- it is a bad ref, or a clone too shallow to contain it. Check out with fetch-depth: 0. git said: $(tr '\n' ' ' < "$tmp/referr")"
             exit 1
           fi
 
+          # Sets PIN_VALUE, not GUARD_PKG. `read_pin` still writes GUARD_PKG -- it is shared with the
+          # older single-location path and its name is accurate there -- so this copies the result
+          # out under a name that says what it is: one candidate's value, not yet the chosen pin.
+          # GUARD_PKG is assigned once, below, to whichever candidate wins, which is the only point
+          # at which the name is true.
           try_pin() {
             local ref="$1" path="$2" what="$3"
             GUARD_PKG=""
+            PIN_VALUE=""
             # Now unambiguous: the ref is known good, so a failure here is the path being absent.
             if ! git cat-file -e "$ref:$path" 2>/dev/null; then
               return 1
             fi
             read_pin "$ref:$path" "$what"
+            PIN_VALUE="$GUARD_PKG"
             return 0
           }
 
@@ -362,10 +383,10 @@ jobs:
           DEDICATED_VALUE=""
           PKG_VALUE=""
           if try_pin "$BASE_REF" "$DEDICATED_PIN_PATH" "$DEDICATED_PIN_PATH $BASE_NOTE"; then
-            DEDICATED_VALUE="$GUARD_PKG"
+            DEDICATED_VALUE="$PIN_VALUE"
           fi
           if try_pin "$BASE_REF" "$PKG_PATH" "$PKG_PATH $BASE_NOTE"; then
-            PKG_VALUE="$GUARD_PKG"
+            PKG_VALUE="$PIN_VALUE"
           fi
 
           # TWO PINS THAT DISAGREE IS A HARD FAILURE. Not a warning, and not a silent precedence
