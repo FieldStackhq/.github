@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ''
+      version:
+        description: 'CalVer version to tag (e.g., 2026.3.5) instead of calculating one. For callers that stamp it into a build before the tag exists. Fails if its tag is on another commit.'
+        required: false
+        type: string
+        default: ''
     outputs:
       version:
         description: 'The CalVer version that was created (e.g., 2026.3.5)'
@@ -41,7 +46,28 @@ jobs:
 
       - name: Calculate next CalVer version
         id: calver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            if [[ ! "$INPUT_VERSION" =~ ^[0-9]{4}\.(1[0-2]|[1-9])\.[1-9][0-9]*$ ]]; then
+              echo "::error::version input is not CalVer YYYY.M.patch"
+              exit 1
+            fi
+            # The caller's build carries this version: a tag on another commit fails; on this commit it is a re-run.
+            if TAG_SHA=$(git rev-parse -q --verify "refs/tags/v${INPUT_VERSION}^{commit}"); then
+              if [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+                echo "::error::tag v${INPUT_VERSION} is already on ${TAG_SHA}; re-run the whole workflow so the build is stamped with a new version"
+                exit 1
+              fi
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+            fi
+            echo "version=${INPUT_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${INPUT_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Using caller's version: ${INPUT_VERSION} (tag: v${INPUT_VERSION})"
+            exit 0
+          fi
+
           YEAR=$(date +%Y)
           MONTH=$(date +%-m)  # No zero-padding
           PREFIX="v${YEAR}.${MONTH}."
@@ -68,7 +94,7 @@ jobs:
           TAG="${{ steps.calver.outputs.tag }}"
 
           # Find the previous CalVer tag (excluding any tag we're about to create)
-          PREV_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-creatordate | head -n 1)
+          PREV_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-creatordate | { grep -vxF "$TAG" || true; } | head -n 1)
 
           if [ -z "$PREV_TAG" ]; then
             RANGE="HEAD"
@@ -133,6 +159,7 @@ jobs:
           echo "Generated changelog for ${TAG}"
 
       - name: Create Git tag
+        if: steps.calver.outputs.exists != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
