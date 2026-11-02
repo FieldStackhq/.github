@@ -1,0 +1,7 @@
+CREATE TABLE #incoming (RuleId INT NOT NULL, Note NVARCHAR(400) NULL);
+MERGE INTO Infra.CurationRule AS t
+USING #incoming AS s ON t.RuleId = s.RuleId
+WHEN MATCHED THEN
+    UPDATE SET t.Note = s.Note
+WHEN NOT MATCHED BY SOURCE THEN
+    DELETE;

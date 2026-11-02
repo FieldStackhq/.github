@@ -1,0 +1,2 @@
+CREATE TABLE #tmp (RuleId INT NOT NULL);
+DELETE x FROM (SELECT TOP (10) * FROM #tmp WHERE RuleId IN (SELECT RuleId FROM Infra.CurationRule) ORDER BY RuleId) AS x;

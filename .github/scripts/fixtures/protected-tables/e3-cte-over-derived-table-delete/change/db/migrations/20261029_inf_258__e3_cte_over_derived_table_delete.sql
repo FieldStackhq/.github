@@ -1,0 +1,2 @@
+WITH c AS (SELECT * FROM (SELECT TOP (100) * FROM Infra.CurationRule ORDER BY RuleId) d)
+DELETE FROM c;

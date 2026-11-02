@@ -31,6 +31,14 @@ on:
         required: false
         type: boolean
         default: true
+      protected-tables:
+        description: >-
+          Comma-separated schema.table names whose data and history the protected-tables check
+          guards. A file needs "-- MIGRATION SAFETY: <schema.table> -- <reason>" to exempt E rules for that
+          table (whole file; never in db/seed/). Empty skips it.
+        required: false
+        type: string
+        default: ''
     secrets:
       ORCHESTRATOR_PAT:
         description: 'PAT to send repository_dispatch to orchestrator'
@@ -371,6 +379,45 @@ jobs:
             fi
           done
           exit $ERRORS
+
+      # The protected-tables check and its harness live in this repo; load them at this workflow's own
+      # commit so the workflow and the script stay in step. Fail rather than fall back to a branch.
+      - name: Locate the protected-tables check
+        if: steps.detect.outputs.db_changed == 'true' && inputs.protected-tables != ''
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          if [ -z "$WORKFLOW_REPOSITORY" ] || [ -z "$WORKFLOW_SHA" ]; then
+            echo "::error::job.workflow_repository or job.workflow_sha is empty; cannot load the protected-tables check at a pinned commit."
+            exit 1
+          fi
+          echo "Loading the protected-tables check from $WORKFLOW_REPOSITORY at $WORKFLOW_SHA"
+
+      - name: Load the protected-tables check
+        if: steps.detect.outputs.db_changed == 'true' && inputs.protected-tables != ''
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .fieldstack-dotgithub
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      # Harness before the gate: a broken check fails here and names itself, rather than passing silently.
+      - name: Test the protected-tables check
+        if: steps.detect.outputs.db_changed == 'true' && inputs.protected-tables != ''
+        timeout-minutes: 10
+        run: bash .fieldstack-dotgithub/.github/scripts/protected_tables.test.sh
+
+      - name: Check protected tables
+        if: steps.detect.outputs.db_changed == 'true' && inputs.protected-tables != ''
+        timeout-minutes: 10
+        env:
+          PROTECTED_TABLES_TEST_CRASH: ''
+          TABLES: ${{ inputs.protected-tables }}
+          RANGE: ${{ steps.detect.outputs.range }}
+        run: python3 .fieldstack-dotgithub/.github/scripts/protected_tables.py --tables "$TABLES" --range "$RANGE"
 
   notify:
     # Dispatch only when a main push actually changed db/ (per the git-diff

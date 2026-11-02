@@ -1,0 +1,1 @@
+DELETE TOP (10) PERCENT FROM Infra.CurationRule;

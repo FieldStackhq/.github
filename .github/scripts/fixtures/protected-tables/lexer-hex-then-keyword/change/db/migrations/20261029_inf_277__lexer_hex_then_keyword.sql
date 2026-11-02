@@ -1,0 +1,1 @@
+SELECT 0x00TRUNCATE TABLE Infra.CurationRule;

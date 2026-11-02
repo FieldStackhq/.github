@@ -1,0 +1,2 @@
+CREATE TABLE dbo.Widget (WidgetId INT NOT NULL PRIMARY KEY, Name NVARCHAR(100) NOT NULL);
+CREATE INDEX IX_Widget_Name ON dbo.Widget (Name);
