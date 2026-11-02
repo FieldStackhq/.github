@@ -1,0 +1,1 @@
+ALTER TABLE Infra.CurationRule SET (SYSTEM_VERSIONING = OFF);

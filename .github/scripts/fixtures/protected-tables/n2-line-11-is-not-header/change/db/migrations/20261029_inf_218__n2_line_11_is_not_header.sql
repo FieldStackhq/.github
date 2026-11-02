@@ -1,0 +1,12 @@
+-- header line 1
+-- header line 2
+-- header line 3
+-- header line 4
+-- header line 5
+-- header line 6
+-- header line 7
+-- header line 8
+-- header line 9
+-- header line 10
+-- @no-transaction
+ALTER TABLE Infra.CurationRule ADD Priority INT NULL;

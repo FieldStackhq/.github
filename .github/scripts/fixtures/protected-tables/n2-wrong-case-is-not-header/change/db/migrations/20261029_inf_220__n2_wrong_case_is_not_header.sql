@@ -1,0 +1,2 @@
+-- @No-Transaction
+ALTER TABLE Infra.CurationRule ADD Priority INT NULL;

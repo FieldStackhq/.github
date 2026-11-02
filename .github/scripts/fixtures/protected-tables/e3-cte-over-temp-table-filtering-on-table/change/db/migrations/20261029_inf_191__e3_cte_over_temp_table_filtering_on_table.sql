@@ -1,0 +1,4 @@
+SET NOCOUNT ON;
+CREATE TABLE #tmp (RuleId INT NOT NULL);
+WITH f AS (SELECT * FROM #tmp WHERE RuleId IN (SELECT RuleId FROM Infra.CurationRule))
+DELETE FROM f;

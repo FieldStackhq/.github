@@ -1,0 +1,6 @@
+SET NOCOUNT ON;
+CREATE TABLE #incoming (RuleId INT NOT NULL);
+WITH cur AS (SELECT * FROM Infra.CurationRule)
+MERGE cur AS t
+USING #incoming AS s ON t.RuleId = s.RuleId
+WHEN NOT MATCHED BY SOURCE THEN DELETE;

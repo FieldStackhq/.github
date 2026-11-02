@@ -1,0 +1,2 @@
+ALTER TABLE dbo.Widget ADD CONSTRAINT FK_Widget_Rule FOREIGN KEY (RuleId)
+    REFERENCES Infra.CurationRule (RuleId) ON DELETE CASCADE;
