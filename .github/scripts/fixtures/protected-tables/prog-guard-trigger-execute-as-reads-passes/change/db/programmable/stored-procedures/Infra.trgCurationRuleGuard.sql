@@ -1,0 +1,1 @@
+CREATE OR ALTER TRIGGER Infra.trgCurationRuleGuard ON Infra.CurationRule WITH EXECUTE AS OWNER AFTER DELETE AS IF EXISTS (SELECT 1 FROM deleted d JOIN Infra.CurationRule r ON r.RuleId = d.RuleId) ROLLBACK;

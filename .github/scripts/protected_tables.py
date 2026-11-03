@@ -43,7 +43,11 @@ DESC = {
             "is not recorded in history"),
     "N3": "SYSTEM_VERSIONING turned OFF needs a later statement, after a ';' or GO, re-attaching it with a "
           "different protected HISTORY_TABLE",
+    "N4": "code in db/programmable/ outside a procedure, function or view body (a trigger counts as outside) "
+          "can run on every deploy and must not write to a protected table, run dynamic SQL "
+          "(EXEC (...), EXEC @v, sp_executesql), or call a procedure in its schema or in this file",
 }
+DEFS = frozenset("PROC PROCEDURE FUNCTION VIEW".split())
 
 
 class Fail(Exception):
@@ -344,7 +348,7 @@ class Scan:
         return len(parts) >= 2 and parts[-2] in schemas
 
 
-def analyze(s, seed):
+def analyze(s, seed, body=0):
     """Return (findings as (rule, table, line), E6 hits as (table, off_line))."""
     res, e6, seen = [], [], set()
     toks, n = s.toks, s.n
@@ -434,8 +438,14 @@ def analyze(s, seed):
                 elif a.text.startswith("@") and not s.punct(k + 1, "="):
                     add(rule, VIA_VAR, t.line)
     if seed:
-        if s.ms and any(t.up in WRITES for t in toks):
-            for c in dict.fromkeys(c for _, _, c in s.ms):
+        # GRANT, DENY, REVOKE and UPDATE STATISTICS write no rows; T-SQL needs no ';', so a write keyword after
+        # their permission list (first ON/TO/FROM) or after STATISTICS starts another statement and is checked.
+        perm = next((k for k in range(1, n) if s.up(k) in ("ON", "TO", "FROM")), 1)
+        no_rows = ((s.up(0) in ("GRANT", "DENY", "REVOKE") and not any(s.up(k) in WRITES for k in range(perm, n)))
+                   or (s.up(0) == "UPDATE" and s.up(1) == "STATISTICS"
+                       and not any(s.up(k) in WRITES for k in range(2, n))))
+        if any(i >= body for i, _, _ in s.ms) and not no_rows and any(t.up in WRITES for t in toks[body:]):
+            for c in dict.fromkeys(c for i, _, c in s.ms if i >= body):
                 add("N1", c, toks[0].line)
         schemas = {sc for sc, _, _ in s.prot}
         for i, t in enumerate(toks):
@@ -551,6 +561,11 @@ def read_text(path):
     return text
 
 
+def last_part(s, k):
+    e = s.name_end(k)
+    return s.toks[e - 1].nm if e > k else None
+
+
 def check_file(path, prot):
     """Return the file's findings as (line, rule, table, message)."""
     text = read_text(path)
@@ -574,9 +589,35 @@ def check_file(path, prot):
     scans = [Scan(sg, prot) for sg in segments(text, toks)]
     low = path.lower()
     seed, mig = low.startswith("db/seed/"), low.startswith("db/migrations/")
+    prog = low.startswith("db/programmable/")
+    # In db/programmable/, a GO batch that does not start CREATE [OR ALTER] | ALTER + PROC/FUNCTION/VIEW is top
+    # level (re-runs every deploy; any write fires a trigger, so it is too). top_hits: its findings, not exemptable.
+    top, defn, top_hits, defs, hdr = set(), False, set(), set(), {}
+    for idx, s in enumerate(scans):
+        if s.batch:
+            k = 1 + 2 * (s.up(0) == "CREATE" and s.up(1) == "OR" and s.up(2) == "ALTER")
+            defn = s.up(0) in ("CREATE", "ALTER") and s.up(k) in DEFS
+            if defn and s.up(k) in ("PROC", "PROCEDURE") and last_part(s, k + 1):
+                defs.add(last_part(s, k + 1))
+            # A trigger header (ON <table> ... FOR|AFTER|INSTEAD OF <events> AS) writes nothing, so the write
+            # test starts after the AS that follows its events (WITH EXECUTE AS comes before them).
+            if s.up(0) in ("CREATE", "ALTER") and s.up(k) == "TRIGGER":
+                f = next((j for j in range(k + 1, s.n) if s.up(j) in ("FOR", "AFTER", "INSTEAD")), k)
+                a = next((j for j in range(f + 1, s.n) if s.up(j) == "AS"), None)
+                if a is not None:
+                    hdr[idx] = a + 1
+        if prog and not defn:
+            top.add(idx)
     found, e6 = [], []
     for idx, s in enumerate(scans):
-        res, hits = analyze(s, seed)
+        # Top level behaves like a seed: analyze's N1 refusals are reported as N4.
+        res, hits = analyze(s, seed or idx in top, hdr.get(idx, 0))
+        if idx in top:
+            res = [("N4" if r == "N1" else r, c, ln) for r, c, ln in res]
+            calls = [i + 1 + 2 * (s.punct(i + 2, "=") and s.toks[i + 1].text.startswith("@"))
+                     for i, t in enumerate(s.toks) if t.up in ("EXEC", "EXECUTE")] + [0] * s.batch
+            res += [("N4", ANY, s.toks[k].line) for k in calls if k < s.n and last_part(s, k) in defs]
+            top_hits.update(res)
         found += res
         e6 += [(idx, c, ln) for c, ln in hits]
     first = {}
@@ -589,37 +630,44 @@ def check_file(path, prot):
     # After versioning goes OFF, any statement that writes, or may write, a protected table is not recorded
     # in history, so the marker must name that table (reads and later statements can over-flag).
     if e6:
-        for s in scans[min(idx for idx, _, _ in e6):]:
+        for j, s in enumerate(scans[min(idx for idx, _, _ in e6):], min(idx for idx, _, _ in e6)):
             if any(t.up in ROW_WRITES for t in s.toks) and s.ms:
                 tabs = list(dict.fromkeys(c for _, _, c in s.ms))
                 for c in tabs:
                     found.append(("E11", c, min(s.toks[i].line for i, _, cc in s.ms if cc == c)))
+                    if j in top:
+                        top_hits.add(found[-1])
     # A table named ...History is treated as a history table: SQL Server only lets it be written while
     # versioning is off, so any statement that writes, or may write, it needs a marker naming it.
     hist = {c for _, t_, c in prot if t_.endswith("history")}
-    for s in scans:
+    for j, s in enumerate(scans):
         if any(t.up in ROW_WRITES for t in s.toks):
             for c in dict.fromkeys(c for _, _, c in s.ms if c in hist):
                 found.append(("E11", c, min(s.toks[i].line for i, _, cc in s.ms if cc == c)))
+                if j in top:
+                    top_hits.add(found[-1])
     found = list(dict.fromkeys(found))
     # A rename/move via a variable flags each table named in code or a whole string (unless already flagged).
     # N2 names the first table in code or a rename/move argument, else one of those named tables.
     cands = sorted([(s.toks[i].start, c) for s in scans for i, _, c in s.ms] + [x for s in scans for x in s.ren])
     named = sorted({c for _, c in cands} | {c for t in toks if t.kind == "str" for c in [str_table(t, prot)] if c})
-    direct = {(r, c) for r, c, _ in found}
-    found = [(r, x, ln) for r, c, ln in found
-             for x in ([y for y in named if (r, y) not in direct] if c == VIA_VAR else [c])]
+    direct = {(r, c, (r, c, ln) in top_hits) for r, c, ln in found}
+    found = [(r, x, ln, (r, c, ln) in top_hits) for r, c, ln in found
+             for x in ([y for y in named if (r, y, (r, c, ln) in top_hits) not in direct] if c == VIA_VAR else [c])]
     refs = [c for s in scans for _, _, c in s.ms]
-    referenced = bool(refs) or any(r in ("E8", "E10") for r, _, _ in found)
+    referenced = bool(refs) or any(r in ("E8", "E10") for r, *_ in found)
     if mig and referenced and no_tx_header(text):
-        found.append(("N2", cands[0][1] if cands else named[0] if named else prot[0][2], 1))
+        found.append(("N2", cands[0][1] if cands else named[0] if named else prot[0][2], 1, False))
     ok, bad = parse_markers(toks, prot) if referenced else (set(), [])
     out = []
-    for rule, c, ln in found:
+    for rule, c, ln, is_top in found:
         if rule[0] == "N":
             out.append((ln, rule, c, DESC[rule]))
         elif seed:
             out.append((ln, rule, c, f"{DESC[rule]}; not allowed under db/seed/, even with a marker"))
+        elif is_top:
+            out.append((ln, rule, c, f"{DESC[rule]}; not allowed at the top level of a db/programmable/ file "
+                        "or in a trigger (it runs on every deploy, or on every write), even with a marker"))
         elif c not in ok:
             out.append((ln, rule, c, f"{DESC[rule]}; add '-- MIGRATION SAFETY: {c} -- <reason>' (reason on the same "
                         "line), and end statements with ';' so a neighbouring statement is not flagged"))

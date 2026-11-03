@@ -1,0 +1,3 @@
+CREATE OR ALTER PROCEDURE Infra.CurationRuleTool AS SELECT 1;
+GO
+INSERT INTO Infra.CurationRule (RuleId) VALUES (1);
