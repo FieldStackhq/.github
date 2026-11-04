@@ -591,8 +591,8 @@ def check_file(path, prot):
     low = path.lower()
     seed, mig = low.startswith("db/seed/"), low.startswith("db/migrations/")
     prog = low.startswith("db/programmable/")
-    # Top level: in db/programmable/, a GO batch that does not start CREATE [OR ALTER] | ALTER + PROC/FUNCTION/VIEW
-    # (re-runs when the file is re-applied), and a trigger batch in any folder (any write fires it). Not exemptable.
+    # Top level: in db/programmable/, a GO batch not starting CREATE [OR ALTER] | ALTER + PROC/FUNCTION/VIEW, and a
+    # trigger batch outside db/seed/ (seeds already apply the seed rules everywhere). Not exemptable.
     top, defn, trig, top_hits, defs, hdr = set(), False, False, set(), set(), {}
     for idx, s in enumerate(scans):
         if s.batch:
