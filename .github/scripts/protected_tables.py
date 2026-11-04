@@ -43,9 +43,10 @@ DESC = {
             "is not recorded in history"),
     "N3": "SYSTEM_VERSIONING turned OFF needs a later statement, after a ';' or GO, re-attaching it with a "
           "different protected HISTORY_TABLE",
-    "N4": "code in db/programmable/ outside a procedure, function or view body (a trigger counts as outside) "
-          "can run on every deploy and must not write to a protected table, run dynamic SQL "
-          "(EXEC (...), EXEC @v, sp_executesql), or call a procedure in its schema or in this file",
+    "N4": "code outside a procedure, function or view body in db/programmable/ re-runs whenever db-deploy "
+          "re-applies the file, and any trigger body outside db/seed/ runs on every write; neither may write to a "
+          "protected table, run dynamic SQL (EXEC (...), EXEC @v, sp_executesql), or call a procedure in its "
+          "schema or in this file",
 }
 DEFS = frozenset("PROC PROCEDURE FUNCTION VIEW".split())
 
@@ -590,9 +591,9 @@ def check_file(path, prot):
     low = path.lower()
     seed, mig = low.startswith("db/seed/"), low.startswith("db/migrations/")
     prog = low.startswith("db/programmable/")
-    # In db/programmable/, a GO batch that does not start CREATE [OR ALTER] | ALTER + PROC/FUNCTION/VIEW is top
-    # level (re-runs every deploy; any write fires a trigger, so it is too). top_hits: its findings, not exemptable.
-    top, defn, top_hits, defs, hdr = set(), False, set(), set(), {}
+    # Top level: in db/programmable/, a GO batch that does not start CREATE [OR ALTER] | ALTER + PROC/FUNCTION/VIEW
+    # (re-runs when the file is re-applied), and a trigger batch in any folder (any write fires it). Not exemptable.
+    top, defn, trig, top_hits, defs, hdr = set(), False, False, set(), set(), {}
     for idx, s in enumerate(scans):
         if s.batch:
             k = 1 + 2 * (s.up(0) == "CREATE" and s.up(1) == "OR" and s.up(2) == "ALTER")
@@ -601,12 +602,13 @@ def check_file(path, prot):
                 defs.add(last_part(s, k + 1))
             # A trigger header (ON <table> ... FOR|AFTER|INSTEAD OF <events> AS) writes nothing, so the write
             # test starts after the AS that follows its events (WITH EXECUTE AS comes before them).
-            if s.up(0) in ("CREATE", "ALTER") and s.up(k) == "TRIGGER":
+            trig = s.up(0) in ("CREATE", "ALTER") and s.up(k) == "TRIGGER"
+            if trig:
                 f = next((j for j in range(k + 1, s.n) if s.up(j) in ("FOR", "AFTER", "INSTEAD")), k)
                 a = next((j for j in range(f + 1, s.n) if s.up(j) == "AS"), None)
                 if a is not None:
                     hdr[idx] = a + 1
-        if prog and not defn:
+        if (prog and not defn) or (trig and not seed):
             top.add(idx)
     found, e6 = [], []
     for idx, s in enumerate(scans):
@@ -651,9 +653,10 @@ def check_file(path, prot):
     # N2 names the first table in code or a rename/move argument, else one of those named tables.
     cands = sorted([(s.toks[i].start, c) for s in scans for i, _, c in s.ms] + [x for s in scans for x in s.ren])
     named = sorted({c for _, c in cands} | {c for t in toks if t.kind == "str" for c in [str_table(t, prot)] if c})
-    direct = {(r, c, (r, c, ln) in top_hits) for r, c, ln in found}
-    found = [(r, x, ln, (r, c, ln) in top_hits) for r, c, ln in found
-             for x in ([y for y in named if (r, y, (r, c, ln) in top_hits) not in direct] if c == VIA_VAR else [c])]
+    found = [(r, c, ln, (r, c, ln) in top_hits) for r, c, ln in found]
+    direct = {(r, c, t) for r, c, _, t in found}
+    found = [(r, x, ln, t) for r, c, ln, t in found
+             for x in ([y for y in named if (r, y, t) not in direct] if c == VIA_VAR else [c])]
     refs = [c for s in scans for _, _, c in s.ms]
     referenced = bool(refs) or any(r in ("E8", "E10") for r, *_ in found)
     if mig and referenced and no_tx_header(text):
@@ -667,7 +670,8 @@ def check_file(path, prot):
             out.append((ln, rule, c, f"{DESC[rule]}; not allowed under db/seed/, even with a marker"))
         elif is_top:
             out.append((ln, rule, c, f"{DESC[rule]}; not allowed at the top level of a db/programmable/ file "
-                        "or in a trigger (it runs on every deploy, or on every write), even with a marker"))
+                        "or in a trigger (it re-runs when the file is re-applied, or on every write), even with a "
+                        "marker"))
         elif c not in ok:
             out.append((ln, rule, c, f"{DESC[rule]}; add '-- MIGRATION SAFETY: {c} -- <reason>' (reason on the same "
                         "line), and end statements with ';' so a neighbouring statement is not flagged"))
